@@ -46,7 +46,7 @@ repos:
         args: [--fix]
 
   - repo: https://github.com/priv-kweihmann/oelint-adv
-    rev: 6.5.6
+    rev: 6.6.2
     hooks:
       - id: oelint-adv
         args: [--rulefile=.oelint-ruleset.json, --hide=info, --quiet]
