@@ -1,3 +1,4 @@
 [codespell]
 exclude-file = .codespellx
 ignore-words-list = FPT,FTP,fpt,ftp,crate
+skip = recipes-bsp/coreboot-utils/files/coreboot-amdtool.patch
