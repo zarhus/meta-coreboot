@@ -1,0 +1,3114 @@
+From a252e0740b0ec1eaa91e4ff6555f5d963d475fb7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Micha=C5=82=20=C5=BBygowski?= <michal.zygowski@3mdeb.com>
+Date: Thu, 9 Oct 2025 12:23:40 +0200
+Subject: [PATCH] util/amdtool: Add utility to dump useful information on AMD
+ CPUs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add an utility similar to inteltool, which dumps useful information
+for porting a board to coreboot.
+
+TEST=Use amdtool on Gigabyte MZ33-AR1 with vendor BIOS and coreboot.
+
+Upstream-Status: Submitted
+Change-Id: I34405897d0f5670038e7923f3680a28090d92821
+Signed-off-by: Michał Żygowski <michal.zygowski@3mdeb.com>
+---
+ util/amdtool/.gitignore     |   1 +
+ util/amdtool/Makefile       |  85 ++++++
+ util/amdtool/acpimmio.c     | 185 ++++++++++++
+ util/amdtool/acpimmio.h     |  12 +
+ util/amdtool/amdtool.8      |  63 ++++
+ util/amdtool/amdtool.c      | 403 ++++++++++++++++++++++++++
+ util/amdtool/amdtool.h      | 136 +++++++++
+ util/amdtool/cpu.c          | 563 ++++++++++++++++++++++++++++++++++++
+ util/amdtool/description.md |   2 +
+ util/amdtool/espi.c         | 199 +++++++++++++
+ util/amdtool/gpio.c         | 394 +++++++++++++++++++++++++
+ util/amdtool/irq.c          | 180 ++++++++++++
+ util/amdtool/lpc.c          | 122 ++++++++
+ util/amdtool/psb.c          | 149 ++++++++++
+ util/amdtool/smn.c          |  42 +++
+ util/amdtool/smn.h          |  15 +
+ util/amdtool/spi.c          | 405 ++++++++++++++++++++++++++
+ 17 files changed, 2956 insertions(+)
+ create mode 100644 util/amdtool/.gitignore
+ create mode 100644 util/amdtool/Makefile
+ create mode 100644 util/amdtool/acpimmio.c
+ create mode 100644 util/amdtool/acpimmio.h
+ create mode 100644 util/amdtool/amdtool.8
+ create mode 100644 util/amdtool/amdtool.c
+ create mode 100644 util/amdtool/amdtool.h
+ create mode 100644 util/amdtool/cpu.c
+ create mode 100644 util/amdtool/description.md
+ create mode 100644 util/amdtool/espi.c
+ create mode 100644 util/amdtool/gpio.c
+ create mode 100644 util/amdtool/irq.c
+ create mode 100644 util/amdtool/lpc.c
+ create mode 100644 util/amdtool/psb.c
+ create mode 100644 util/amdtool/smn.c
+ create mode 100644 util/amdtool/smn.h
+ create mode 100644 util/amdtool/spi.c
+
+diff --git a/util/amdtool/.gitignore b/util/amdtool/.gitignore
+new file mode 100644
+index 000000000000..2466c9f85067
+--- /dev/null
++++ b/util/amdtool/.gitignore
+@@ -0,0 +1 @@
++amdtool
+diff --git a/util/amdtool/Makefile b/util/amdtool/Makefile
+new file mode 100644
+index 000000000000..e2e15a030dda
+--- /dev/null
++++ b/util/amdtool/Makefile
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++PROGRAM = amdtool
++
++top ?= $(abspath ../..)
++
++CC      ?= gcc
++INSTALL ?= /usr/bin/env install
++PREFIX  ?= /usr/local
++CFLAGS  ?= -O2 -g -Wall -Wextra -Wmissing-prototypes
++LDFLAGS += -lpci -lz
++
++CPPFLAGS += -I$(top)/util/amdtool
++CPPFLAGS += -I$(top)/src/commonlib/include -I$(top)/src/commonlib/bsd/include
++CPPFLAGS += -I$(top)/src/arch/x86/include
++
++OBJS = amdtool.o gpio.o acpimmio.o spi.o lpc.o psb.o smn.o cpu.o irq.o espi.o
++
++OS_ARCH	= $(shell uname)
++ifeq ($(OS_ARCH), Darwin)
++LDFLAGS += -framework DirectHW
++endif
++ifeq ($(OS_ARCH), FreeBSD)
++CPPFLAGS += -I/usr/local/include
++LDFLAGS += -L/usr/local/lib
++LIBS = -lz
++endif
++ifeq ($(OS_ARCH), NetBSD)
++CPPFLAGS += -I/usr/pkg/include
++LDFLAGS += -L/usr/pkg/lib -Wl,-rpath-link,/usr/pkg/lib -lz -lpciutils -lpci -l$(shell uname -p)
++endif
++
++all: pciutils dep $(PROGRAM)
++
++$(PROGRAM): $(OBJS)
++	$(CC) $(CFLAGS) $(CPPFLAGS) -o $(PROGRAM) $(OBJS) $(LDFLAGS)
++
++clean:
++	rm -f $(PROGRAM) *.o *~ junit.xml .dependencies
++
++distclean: clean
++	rm -f .dependencies
++
++dep:
++	@$(CC) $(CFLAGS) $(CPPFLAGS) -MM *.c > .dependencies
++
++define LIBPCI_TEST
++/* Avoid a failing test due to libpci header symbol shadowing breakage */
++#define index shadow_workaround_index
++#ifdef __NetBSD__
++#include <pciutils/pci.h>
++#else
++#include <pci/pci.h>
++#endif
++struct pci_access *pacc;
++int main(int argc, char **argv)
++{
++	(void) argc;
++	(void) argv;
++	pacc = pci_alloc();
++	return 0;
++}
++endef
++export LIBPCI_TEST
++
++pciutils:
++	@printf "\nChecking for pciutils and zlib... "
++	@echo "$$LIBPCI_TEST" > .test.c
++	@$(CC) $(CFLAGS) $(CPPFLAGS) .test.c -o .test $(LDFLAGS)	  \
++						>/dev/null 2>&1 &&	  \
++		printf "found.\n" || ( printf "not found.\n\n";		  \
++		printf "Please install pciutils-devel and zlib-devel.\n"; \
++		printf "See README for more information.\n\n";		  \
++		rm -f .test.c .test; exit 1)
++	@rm -rf .test.c .test .test.dSYM
++
++install: $(PROGRAM)
++	$(INSTALL) -d $(DESTDIR)$(PREFIX)/sbin
++	$(INSTALL) $(PROGRAM) $(DESTDIR)$(PREFIX)/sbin
++	$(INSTALL) -d $(DESTDIR)$(PREFIX)/share/man/man8
++	$(INSTALL) -p -m644 $(PROGRAM).8 $(DESTDIR)$(PREFIX)/share/man/man8
++
++.PHONY: all clean distclean dep pciutils
++
++-include .dependencies
+diff --git a/util/amdtool/acpimmio.c b/util/amdtool/acpimmio.c
+new file mode 100644
+index 000000000000..b5ac4dd9f3af
+--- /dev/null
++++ b/util/amdtool/acpimmio.c
+@@ -0,0 +1,185 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <inttypes.h>
++#include <assert.h>
++#include "acpimmio.h"
++#include "amdtool.h"
++
++#define ACPIMMIO_REGION_SIZE 0x100
++
++const uint8_t *acpimmio_bar = NULL;
++size_t acpimmio_size = 0;
++
++static const io_register_t kunlun_acpi_mmio_regions[] = {
++	{ 0x0000, ACPIMMIO_REGION_SIZE, "SMB PCI" },
++	{ 0x0200, ACPIMMIO_REGION_SIZE, "SMI" },
++	{ 0x0300, ACPIMMIO_REGION_SIZE, "PMIO" },
++	{ 0x0400, ACPIMMIO_REGION_SIZE, "PMIO2" },
++	{ 0x0500, ACPIMMIO_REGION_SIZE, "BIOS RAM" },
++	{ 0x0600, ACPIMMIO_REGION_SIZE, "CMOS RAM" },
++	{ 0x0700, ACPIMMIO_REGION_SIZE, "CMOS" },
++	{ 0x0800, ACPIMMIO_REGION_SIZE, "ACPI" },
++	{ 0x0900, ACPIMMIO_REGION_SIZE, "ASF" },
++	{ 0x0a00, ACPIMMIO_REGION_SIZE, "SMB IO" },
++	{ 0x0b00, ACPIMMIO_REGION_SIZE, "WDT" },
++	{ 0x0c00, ACPIMMIO_REGION_SIZE, "HPET" },
++	{ 0x0d00, ACPIMMIO_REGION_SIZE, "IOMUX" },
++	{ 0x0e00, ACPIMMIO_REGION_SIZE, "MISC" },
++	{ 0x1000, ACPIMMIO_REGION_SIZE, "Serial debug" },
++	{ 0x1100, ACPIMMIO_REGION_SIZE, "Shadow timer" },
++	{ 0x1200, ACPIMMIO_REGION_SIZE, "Remote GPIO+IOMUX" },
++	{ 0x1300, ACPIMMIO_REGION_SIZE, "MISC2" },
++	{ 0x1400, ACPIMMIO_REGION_SIZE, "DP-VGA" },
++	{ 0x1500, ACPIMMIO_REGION_SIZE, "GPIO0" },
++	{ 0x1600, ACPIMMIO_REGION_SIZE, "GPIO1" },
++	{ 0x1700, ACPIMMIO_REGION_SIZE, "GPIO2" },
++	{ 0x1800, ACPIMMIO_REGION_SIZE, "GPIO3" },
++	{ 0x1900, ACPIMMIO_REGION_SIZE, "GPIO4" },
++	{ 0x1d00, ACPIMMIO_REGION_SIZE, "AC DC TIMER" },
++	{ 0x1e00, ACPIMMIO_REGION_SIZE, "AOAC" },
++};
++
++static uint8_t pmio_read8(uint8_t reg)
++{
++	outb(reg, 0xcd6);
++	return inb(0xcd7);
++}
++
++static void print_region(const uint32_t offset)
++{
++	unsigned int i, j;
++
++	printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n");
++
++	for (i = 0; i < 0x100; i += 16) {
++		printf("%02x: ", i);
++		for (j = 0; j < 16; j++) {
++			printf("%02"PRIx8, read8(acpimmio_bar + offset + i + j));
++			if (j < 15)
++				printf(" ");
++		}
++		printf("\n");
++	}
++}
++
++static void print_acpi_mmio_regions(const io_register_t *acpi_mmio_regions, size_t size)
++{
++	size_t i;
++
++	if (acpi_mmio_regions == NULL)
++		return;
++
++	for (i = 0; i < size; i++) {
++		printf("\n========== %s (offset 0x%04x) ==========\n",
++		       acpi_mmio_regions[i].name, acpi_mmio_regions[i].addr);
++		print_region(acpi_mmio_regions[i].addr);
++	}
++}
++
++static int init_acpimmio(struct pci_dev *sb)
++{
++	pciaddr_t acpimmio_phys;
++	bool acpimmio_enabled = false;
++	int smbus_rev = 0;
++
++	if (acpimmio_bar)
++		return 1;
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			acpimmio_phys = 0xfed80000;
++			acpimmio_size = 0x2000;
++			acpimmio_enabled = !!(pmio_read8(0x4) & 0x2);
++			break;
++		default:
++			printf("Error: Dumping ACPI MMIO on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		perror("Error: Dumping ACPI MMIO on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	if (!acpimmio_enabled) {
++		perror("ACPI MMIO not decoded by the soutbridge\n");
++		return 1;
++	}
++
++	if (acpimmio_phys == 0 || acpimmio_size == 0) {
++		perror("Error: Invalid ACPI MMIO address or size.\n");
++		return 1;
++	}
++
++	printf("ACPI MMIO = 0x%08"PRIx64" (size 0x%"PRIx64") (MEM)\n\n", (uint64_t)acpimmio_phys, acpimmio_size);
++	acpimmio_bar = map_physical(acpimmio_phys, acpimmio_size);
++	if (!acpimmio_bar) {
++		perror("Error mapping ACPI MMIO");
++		return 1;
++	}
++
++	return 0;
++}
++
++int print_acpimmio(struct pci_dev *sb)
++{
++	int smbus_rev = 0;
++	size_t acpimmio_regions_size = 0;
++	const io_register_t *acpi_mmio_regions = NULL;
++
++	printf("\n========== ACPI MMIO ==========\n\n");
++	
++	if (init_acpimmio(sb))
++		return 1;
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			acpi_mmio_regions = kunlun_acpi_mmio_regions;
++			acpimmio_regions_size = ARRAY_SIZE(kunlun_acpi_mmio_regions);
++			break;
++		default:
++			printf("Error: Dumping ACPI MMIO on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		perror("Error: Dumping ACPI MMIO on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	print_acpi_mmio_regions(acpi_mmio_regions, acpimmio_regions_size);
++
++	return 0;
++}
++
++const uint8_t *get_acpi_mmio_bar(struct pci_dev *sb)
++{
++	init_acpimmio(sb);
++
++	return (const uint8_t *)acpimmio_bar;
++}
++
++void acpimmio_cleanup(void)
++{
++	if (acpimmio_bar)
++		unmap_physical((void *)acpimmio_bar, acpimmio_size);
++}
+diff --git a/util/amdtool/acpimmio.h b/util/amdtool/acpimmio.h
+new file mode 100644
+index 000000000000..53582f60b6d0
+--- /dev/null
++++ b/util/amdtool/acpimmio.h
+@@ -0,0 +1,12 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef AMDTOOL_ACPIMMIO_H
++#define AMDTOOL_ACPIMMIO_H 1
++
++#include "amdtool.h"
++
++const uint8_t *get_acpi_mmio_bar(struct pci_dev *sb);
++void acpimmio_cleanup(void);
++
++#endif
+diff --git a/util/amdtool/amdtool.8 b/util/amdtool/amdtool.8
+new file mode 100644
+index 000000000000..45952760883d
+--- /dev/null
++++ b/util/amdtool/amdtool.8
+@@ -0,0 +1,63 @@
++.TH AMDTOOL 8
++.SH NAME
++amdtool \- a tool for dumping AMD CPU / chipset configuration parameters
++.SH SYNOPSIS
++.B amdtool \fR[\fB\-vh?gGlcMApsa\fR]
++.SH DESCRIPTION
++.B amdtool
++is a handy little tool for dumping the configuration space of AMD
++CPUs, northbridges and southbridges.
++.sp
++This tool has been developed for the coreboot project (see
++.B https://coreboot.org
++for details on coreboot).
++.SH OPTIONS
++.TP
++.B "\-h, \-\-help"
++Show a help text and exit.
++.TP
++.B "\-v, \-\-version"
++Show version information and exit.
++.TP
++.B "\-a, \-\-all"
++Dump all known information listed below.
++.TP
++.B "\-c, \-\-cpu"
++Dump CPU information and features.
++.TP
++.B "\-g, \-\-gpio"
++Dump Fusion Controller Hub (FCH) southbridge GPIO registers.
++.TP
++.B "\-G, \-\-gpio-diffs"
++Show only GPIO register differences from hardware defaults.
++.TP
++.B "\-i, \-\-irq-routing"
++Dump Fusion Controller Hub (FCH) southbridge IRQ routing registers.
++.TP
++.B "\-s, \-\-spi"
++Dump Fusion Controller Hub (FCH) southbridge SPI registers.
++.TP
++.B "\-l, \-\-lpc"
++Dump Fusion Controller Hub (FCH) southbridge LPC registers.
++.TP
++.B "\-M, \-\-msrs"
++Dump AMD CPU MSRs.
++.TP
++.B "\-A, \-\-acpimmio"
++Dump Fusion Controller Hub (FCH) southbridge ACPI MMIO registers.
++.TP
++.B "\-p, \-\-psb"
++Dump Platform Secure Boot State.
++.SH BUGS
++Please report any bugs on the coreboot mailing list
++.RB "(" https://coreboot.org/Mailinglist ")."
++.SH LICENCE
++.B amdtool
++is covered by the GNU General Public License (GPL), version 2.
++.SH COPYRIGHT
++Copyright (C) 2024 3mdeb
++.SH AUTHORS
++Michał Żygowski <michal.zygowski@3mdeb.com>
++.PP
++This manual page was written by Michał Żygowski <michal.zygowski@3mdeb.com>.
++It is licensed under the terms of the GNU GPL (version 2).
+diff --git a/util/amdtool/amdtool.c b/util/amdtool/amdtool.c
+new file mode 100644
+index 000000000000..22306f78c077
+--- /dev/null
++++ b/util/amdtool/amdtool.c
+@@ -0,0 +1,403 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <inttypes.h>
++#include <getopt.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <errno.h>
++#include <limits.h>
++
++#include "acpimmio.h"
++#include "amdtool.h"
++#include "smn.h"
++
++#ifdef __NetBSD__
++#include <machine/sysarch.h>
++#endif
++
++static const struct {
++	uint16_t vendor_id, device_id;
++	char *name;
++} supported_chips_list[] = {
++	/* Host bridges/DRAM controllers (Northbridges) */
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_ROOT_COMPLEX, "Turin Root Complex" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_0, "Turin Data Fabric 0" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_1, "Turin Data Fabric 1" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_2, "Turin Data Fabric 2" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_3, "Turin Data Fabric 3" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_4, "Turin Data Fabric 4" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_5, "Turin Data Fabric 5" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_6, "Turin Data Fabric 6" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_7, "Turin Data Fabric 7" },
++
++	/* FCHs (Southbridges) */
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_1, "FCH SMBus Controller" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_LPC_1, "FCH LPC Bridge" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2, "FCH SMBus Controller" },
++	{ PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_LPC_2, "FCH LPC Bridge" },
++};
++
++#ifndef __DARWIN__
++static int fd_mem;
++
++void *map_physical(uint64_t phys_addr, size_t len)
++{
++	void *virt_addr;
++
++	virt_addr = mmap(0, len, PROT_WRITE | PROT_READ, MAP_SHARED,
++		    fd_mem, (off_t) phys_addr);
++
++	if (virt_addr == MAP_FAILED) {
++		printf("Error mapping physical memory 0x%08" PRIx64 "[0x%zx]\n",
++			phys_addr, len);
++		return NULL;
++	}
++
++	return virt_addr;
++}
++
++void unmap_physical(void *virt_addr, size_t len)
++{
++	munmap(virt_addr, len);
++}
++#endif
++
++static struct pci_access *pacc;
++
++static struct pci_dev *pci_dev_find(uint16_t vendor, uint16_t device)
++{
++	struct pci_dev *temp;
++	struct pci_filter filter;
++
++	pci_filter_init(NULL, &filter);
++	filter.vendor = vendor;
++	filter.device = device;
++
++	for (temp = pacc->devices; temp; temp = temp->next)
++		if (pci_filter_match(&filter, temp))
++			return temp;
++
++	return NULL;
++}
++
++int find_smbus_dev_rev(uint16_t vendor, uint16_t device)
++{
++	struct pci_dev *smbus_dev = pci_dev_find(vendor, device);
++	if (!smbus_dev) {
++		printf("No SMBus device with ID %04X:%04X found.\n", vendor, device);
++		perror("ERROR: SMBus device not found.\n");
++		return -1;
++	}
++	return pci_read_byte(smbus_dev, PCI_REVISION_ID);
++}
++
++static void print_version(void)
++{
++	printf("amdtool v%s -- ", AMDTOOL_VERSION);
++	printf("Copyright (C) 2024 3mdeb\n\n");
++	printf("This program is free software: you can redistribute it and/or modify\n"
++	       "it under the terms of the GNU General Public License as published by\n"
++	       "the Free Software Foundation, version 2 of the License.\n\n"
++	       "This program is distributed in the hope that it will be useful,\n"
++	       "but WITHOUT ANY WARRANTY; without even the implied warranty of\n"
++	       "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n"
++	       "GNU General Public License for more details.\n\n");
++}
++
++static void print_usage(const char *name)
++{
++	printf("usage: %s [-vh?gicspGlMAa]\n", name);
++	printf("\n"
++	     "   -v | --version:                   print the version\n"
++	     "   -h | --help:                      print this help\n\n"
++	     "   -s | --spi:                       dump southbridge spi and bios_cntrl registers\n"
++	     "   -g | --gpio:                      dump southbridge GPIO registers\n"
++	     "   -G | --gpio-diffs:                show GPIO differences from defaults\n"
++	     "   -i | --irq-routing                dump IRQ routing registers\n"
++	     "   -l | --lpc:                       dump southbridge LPC/eSPI Interface registers\n\n"
++	     "   -c | --cpu:                       dump CPU information and features\n\n"
++	     "   -M | --msrs:                      dump CPU MSRs\n"
++	     "   -A | --acpimmio:                  dump southbridge ACPI MMIO registers\n"
++	     "   -p | --psb:                       dump Platform Secure Boot state\n"
++	     "   -a | --all:                       dump all known (safe) registers\n"
++	     "\n");
++	exit(1);
++}
++
++static void print_system_info(struct pci_dev *nb, struct pci_dev *sb,
++			      struct pci_dev *smb, struct pci_dev *gfx)
++{
++	unsigned int id, i;
++	char *sbname = "unknown", *nbname = "unknown", *gfxname = "unknown", *smbname = "unknown";
++
++	id = cpuid(1);
++
++	/* Determine names */
++	for (i = 0; i < ARRAY_SIZE(supported_chips_list); i++) {
++		if (nb->device_id == supported_chips_list[i].device_id)
++			nbname = supported_chips_list[i].name;
++		if (sb->device_id == supported_chips_list[i].device_id)
++			sbname = supported_chips_list[i].name;
++		if (smb->device_id == supported_chips_list[i].device_id)
++			smbname = supported_chips_list[i].name;
++	}
++	if (gfx) {
++		for (i = 0; i < ARRAY_SIZE(supported_chips_list); i++)
++			if (gfx->device_id == supported_chips_list[i].device_id)
++				gfxname = supported_chips_list[i].name;
++	}
++	printf("CPU: ID 0x%x, Processor Type 0x%x, Family 0x%x, Model 0x%x, Stepping 0x%x\n",
++			id, (id >> 12) & 0x3, ((id >> 8) & 0xf) + ((id >> 20) & 0xff),
++			((id >> 12) & 0xf0) + ((id >> 4) & 0xf), (id & 0xf));
++
++	printf("Northbridge: %04x:%04x (%s)\n",
++		nb->vendor_id, nb->device_id, nbname);
++
++	printf("Southbridge SMBus: %04x:%04x rev %02x (%s)\n",
++		smb->vendor_id, smb->device_id, pci_read_byte(smb, PCI_REVISION_ID), smbname);
++
++	printf("Southbridge LPC: %04x:%04x rev %02x (%s)\n",
++		sb->vendor_id, sb->device_id, pci_read_byte(sb, PCI_REVISION_ID), sbname);
++
++	if (gfx)
++		printf("Integrated Graphics: %04x:%04x (%s)\n",
++		       gfx->vendor_id, gfx->device_id, gfxname);
++}
++
++int main(int argc, char *argv[])
++{
++	struct pci_dev *sb = NULL, *nb, *gfx = NULL, *smb = NULL, *dev;
++	int opt, option_index = 0;
++
++	int dump_gpios = 0, dump_coremsrs = 0, dump_acpimmio = 0, dump_cpu = 0;
++	int dump_spi = 0, dump_lpc = 0, show_gpio_diffs = 0, dump_psb = 0, dump_irq = 0;
++
++	static struct option long_options[] = {
++		{"version", 0, 0, 'v'},
++		{"help", 0, 0, 'h'},
++		{"gpios", 0, 0, 'g'},
++		{"gpio-diffs", 0, 0, 'G'},
++		{"irq-routing", 0, 0, 'i'},
++		{"lpc", 0, 0, 'l'},
++		{"cpu", 0, 0, 'c'},
++		{"msrs", 0, 0, 'M'},
++		{"acpimmio", 0, 0, 'A'},
++		{"psb", 0, 0, 'p'},
++		{"spi", 0, 0, 's'},
++		{"all", 0, 0, 'a'},
++		{0, 0, 0, 0}
++	};
++
++	while ((opt = getopt_long(argc, argv, "vh?gGilcMApsa",
++				  long_options, &option_index)) != EOF) {
++		switch (opt) {
++		case 'v':
++			print_version();
++			exit(0);
++			break;
++		case 'g':
++			dump_gpios = 1;
++			break;
++		case 'G':
++			show_gpio_diffs = 1;
++			break;
++		case 'i':
++			dump_irq = 1;
++			break;
++		case 'l':
++			dump_lpc = 1;
++			break;
++		case 'c':
++			dump_cpu = 1;
++			break;
++		case 'M':
++			dump_coremsrs = 1;
++			break;
++		case 'A':
++			dump_acpimmio = 1;
++			break;
++		case 'p':
++			dump_psb = 1;
++			break;
++		case 's':
++			dump_spi = 1;
++			break;
++		case 'a':
++			dump_gpios = 1;
++			show_gpio_diffs = 1;
++			dump_irq = 1;
++			dump_lpc = 1;
++			dump_cpu = 1;
++			dump_coremsrs = 1;
++			dump_acpimmio = 1;
++			dump_spi = 1;
++			dump_psb = 1;
++			break;
++		case 'h':
++		case '?':
++		default:
++			print_usage(argv[0]);
++			exit(0);
++			break;
++		}
++	}
++
++#if defined(__FreeBSD__)
++	if (open("/dev/io", O_RDWR) < 0) {
++		perror("/dev/io");
++#elif defined(__NetBSD__)
++# ifdef __i386__
++	if (i386_iopl(3)) {
++		perror("iopl");
++# else
++	if (x86_64_iopl(3)) {
++		perror("iopl");
++# endif
++#else
++	if (iopl(3)) {
++		perror("iopl");
++#endif
++		printf("You need to be root.\n");
++		exit(1);
++	}
++
++#ifndef __DARWIN__
++	if ((fd_mem = open("/dev/mem", O_RDWR)) < 0) {
++		perror("Can not open /dev/mem");
++		exit(1);
++	}
++#endif
++
++	pacc = pci_alloc();
++	pacc->method = PCI_ACCESS_I386_TYPE1;
++	pci_init(pacc);
++	pci_scan_bus(pacc);
++
++	/* Find the required devices */
++	for (dev = pacc->devices; dev; dev = dev->next) {
++		pci_fill_info(dev, PCI_FILL_CLASS);
++		/* The ISA/LPC bridge can be 0x1f, 0x07, or 0x04 so we probe. */
++		if (dev->device_class == 0x0601) { /* ISA/LPC bridge */
++			if (sb == NULL) {
++				sb = dev;
++			} else {
++				fprintf(stderr, "Multiple devices with class ID"
++					" 0x0601, using %02x%02x:%02x.%02x\n",
++					sb->domain, sb->bus, sb->dev, sb->func);
++				break;
++			}
++		}
++	}
++
++	if (!sb) {
++		printf("No southbridge found.\n");
++		exit(1);
++	}
++
++	pci_fill_info(sb, PCI_FILL_IDENT | PCI_FILL_BASES | PCI_FILL_CLASS);
++
++	if (sb->vendor_id != PCI_VENDOR_ID_AMD) {
++		printf("Not an AMD southbridge.\n");
++		exit(1);
++	}
++
++	nb = pci_get_dev(pacc, 0, 0, 0x00, 0);
++	if (!nb) {
++		printf("No northbridge found.\n");
++		exit(1);
++	}
++
++	pci_fill_info(nb, PCI_FILL_IDENT | PCI_FILL_BASES | PCI_FILL_CLASS);
++
++	if (nb->vendor_id != PCI_VENDOR_ID_AMD) {
++		printf("Not an AMD northbridge.\n");
++		exit(1);
++	}
++
++	smb = pci_get_dev(pacc, 0, 0, 0x14, 0);
++	if (!smb) {
++		printf("No SMBus Controller found.\n");
++		exit(1);
++	}
++
++	pci_fill_info(smb, PCI_FILL_IDENT | PCI_FILL_BASES | PCI_FILL_CLASS);
++
++	if (smb->vendor_id != PCI_VENDOR_ID_AMD) {
++		printf("Not an AMD southbridge.\n");
++		exit(1);
++	}
++
++	gfx = pci_get_dev(pacc, 0, 0, 0x02, 0);
++	if (gfx) {
++		pci_fill_info(gfx, PCI_FILL_IDENT | PCI_FILL_BASES |
++				   PCI_FILL_CLASS);
++		if ((gfx->device_class & 0xff00) != 0x0300)
++			gfx = NULL;
++		else if (gfx->vendor_id != PCI_VENDOR_ID_AMD)
++			gfx = NULL;
++	}
++
++	print_system_info(nb, sb, smb, gfx);
++
++	init_smn(nb);
++
++	/* Now do the deed */
++
++	if (dump_lpc) {
++		print_lpc(sb);
++		printf("\n\n");
++		print_espi(sb);
++		printf("\n\n");
++	}
++
++	if (dump_cpu) {
++		print_cpu_info();
++		printf("\n\n");
++	}
++
++	if (dump_coremsrs) {
++		print_amd_msrs();
++		printf("\n\n");
++	}
++
++	if (dump_acpimmio) {
++		print_acpimmio(sb);
++		printf("\n\n");
++	}
++
++	if (dump_gpios) {
++		print_gpios(sb, 1, show_gpio_diffs);
++		printf("\n\n");
++	} else if (show_gpio_diffs) {
++		print_gpios(sb, 0, show_gpio_diffs);
++		printf("\n\n");
++	}
++
++	if (dump_spi) {
++		print_spi(sb);
++		printf("\n\n");
++	}
++
++	if (dump_irq) {
++		print_irq_routing(sb);
++		printf("\n\n");
++	}
++
++	if (dump_psb) {
++		print_psb(nb);
++		printf("\n\n");
++	}
++
++	/* Clean up */
++	acpimmio_cleanup();
++	pci_free_dev(nb);
++	/* `sb` wasn't allocated by pci_get_dev() */
++	pci_cleanup(pacc);
++
++	return 0;
++}
+diff --git a/util/amdtool/amdtool.h b/util/amdtool/amdtool.h
+new file mode 100644
+index 000000000000..3c800c6a5316
+--- /dev/null
++++ b/util/amdtool/amdtool.h
+@@ -0,0 +1,136 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef AMDTOOL_H
++#define AMDTOOL_H 1
++
++#if defined(__linux__)
++#include <linux/stddef.h>
++#endif
++#include <arch/mmio.h>
++#include <commonlib/helpers.h>
++
++#include <stdint.h>
++
++#if defined(__linux__)
++#include <sys/io.h>
++#endif
++#if (defined(__MACH__) && defined(__APPLE__))
++/* DirectHW is available here: https://www.coreboot.org/DirectHW */
++#define __DARWIN__
++#include <DirectHW/DirectHW.h>
++#endif
++
++#ifdef __NetBSD__
++#include <pciutils/pci.h>
++#else
++#include <pci/pci.h>
++#endif
++
++/* This #include is needed for freebsd_{rd,wr}msr. */
++#if defined(__FreeBSD__)
++#include <machine/cpufunc.h>
++#endif
++
++#ifdef __NetBSD__
++static inline uint8_t inb(unsigned port)
++{
++	uint8_t data;
++	__asm volatile("inb %w1,%0" : "=a" (data) : "d" (port));
++	return data;
++}
++static inline uint16_t inw(unsigned port)
++{
++	uint16_t data;
++	__asm volatile("inw %w1,%0": "=a" (data) : "d" (port));
++	return data;
++}
++static inline uint32_t inl(unsigned port)
++{
++	uint32_t data;
++	__asm volatile("inl %w1,%0": "=a" (data) : "d" (port));
++	return data;
++}
++
++static inline void outb(uint8_t value, uint16_t port)
++{
++	__asm__ __volatile__ ("outb %0, %w1" : : "a" (value), "d" (port));
++}
++
++static inline void outw(uint16_t value, uint16_t port)
++{
++	__asm__ __volatile__ ("outw %0, %w1" : : "a" (value), "d" (port));
++}
++
++static inline void outl(uint32_t value, uint16_t port)
++{
++	__asm__ __volatile__ ("outl %0, %w1" : : "a" (value), "d" (port));
++}
++#endif
++
++#define AMDTOOL_VERSION "0.1"
++
++#define PCI_VENDOR_ID_AMD			0x1022
++
++#define PCI_DEVICE_ID_AMD_ZP_ROOT_COMPLEX	0x1450
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_0	0x1460
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_1	0x1461
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_2	0x1462
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_3	0x1463
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_4	0x1464
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_5	0x1465
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_6	0x1466
++#define PCI_DEVICE_ID_AMD_ZP_DATA_FABRIC_7	0x1467
++#define PCI_DEVICE_ID_AMD_FCH_SMB_1		0x780b
++#define PCI_DEVICE_ID_AMD_FCH_LPC_1		0x780e
++#define PCI_DEVICE_ID_AMD_FCH_SMB_2		0x790b
++#define PCI_DEVICE_ID_AMD_FCH_LPC_2		0x790e
++
++#define PCI_DEVICE_ID_AMD_BRH_ROOT_COMPLEX	0x153a
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_0	0x12c0
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_1	0x12c1
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_2	0x12c2
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_3	0x12c3
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_4	0x12c4
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_5	0x12c5
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_6	0x12c6
++#define PCI_DEVICE_ID_AMD_BRH_DATA_FABRIC_7	0x12c7
++
++#define CPUID_TURIN_C1				0x00b00f21
++
++#if !defined(__DARWIN__) && !defined(__FreeBSD__)
++typedef struct { uint32_t hi, lo; } msr_t;
++#endif
++#if defined (__FreeBSD__)
++/* FreeBSD already has conflicting definitions for wrmsr/rdmsr. */
++#undef rdmsr
++#undef wrmsr
++#define rdmsr freebsd_rdmsr
++#define wrmsr freebsd_wrmsr
++typedef struct { uint32_t hi, lo; } msr_t;
++#endif
++typedef struct { uint16_t addr; int size; char *name; } io_register_t;
++typedef struct {
++	uint32_t eax;
++	uint32_t ebx;
++	uint32_t ecx;
++	uint32_t edx;
++} cpuid_result_t;
++
++void *map_physical(uint64_t phys_addr, size_t len);
++void unmap_physical(void *virt_addr, size_t len);
++
++int find_smbus_dev_rev(uint16_t vendor, uint16_t device);
++
++uint32_t cpuid(uint32_t eax);
++int print_amd_msrs(void);
++int print_cpu_info(void);
++int print_lpc(struct pci_dev *sb);
++int print_espi(struct pci_dev *sb);
++int print_gpios(struct pci_dev *sb, int show_all, int show_diffs);
++int print_spi(struct pci_dev *sb);
++int print_acpimmio(struct pci_dev *sb);
++void print_psb(struct pci_dev *nb);
++int print_irq_routing(struct pci_dev *sb);
++
++#endif
+diff --git a/util/amdtool/cpu.c b/util/amdtool/cpu.c
+new file mode 100644
+index 000000000000..7e2995205034
+--- /dev/null
++++ b/util/amdtool/cpu.c
+@@ -0,0 +1,563 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <limits.h>
++
++#include "amdtool.h"
++#include "smn.h"
++
++#ifdef __x86_64__
++# define BREG	"%%rbx"
++#else
++# define BREG	"%%ebx"
++#endif
++
++typedef struct {
++	uint32_t number;	
++	char *name;
++} msr_entry_t;
++
++int fd_msr;
++
++uint32_t cpuid(uint32_t eax)
++{
++	uint32_t ret;
++
++#if defined(__PIC__) || defined(__DARWIN__) && !defined(__LP64__)
++	asm volatile (
++		"push " BREG "\n\t"
++		"cpuid\n\t"
++		"pop " BREG "\n\t"
++		: "=a" (ret) : "a" (eax) : "%ecx", "%edx"
++	);
++#else
++	asm ("cpuid" : "=a" (ret) : "a" (eax) : "%ebx", "%ecx", "%edx");
++#endif
++
++	return ret;
++}
++
++static inline cpuid_result_t cpuid_ext(uint32_t eax, unsigned int ecx)
++{
++	cpuid_result_t result;
++
++#ifndef __DARWIN__
++	asm volatile (
++			"mov %%ebx, %%edi;"
++			"cpuid;"
++			"mov %%ebx, %%esi;"
++			"mov %%edi, %%ebx;"
++			: "=a" (result.eax),
++			"=S" (result.ebx),
++			"=c" (result.ecx),
++			"=d" (result.edx)
++			: "0" (eax), "2" (ecx)
++			: "edi");
++#endif
++	return result;
++}
++
++#ifndef __DARWIN__
++int msr_readerror = 0;
++
++static msr_t rdmsr(unsigned int addr)
++{
++	uint32_t buf[2];
++	msr_t msr = { 0xffffffff, 0xffffffff };
++
++	if (lseek(fd_msr, (off_t) addr, SEEK_SET) == -1) {
++		perror("Could not lseek() to MSR");
++		close(fd_msr);
++		exit(1);
++	}
++
++	if (read(fd_msr, buf, 8) == 8) {
++		msr.lo = buf[0];
++		msr.hi = buf[1];
++		return msr;
++	}
++
++	if (errno == 5) {
++		printf(" (*)"); // Not all bits of the MSR could be read
++		msr_readerror = 1;
++	} else {
++		// A severe error.
++		perror("Could not read() MSR");
++		close(fd_msr);
++		exit(1);
++	}
++
++	return msr;
++}
++
++static int open_and_seek(int cpu, unsigned long msr, int mode, int *fd)
++{
++	char dev[32];
++	char temp_string[50];
++
++	snprintf(dev, sizeof(dev), "/dev/cpu/%d/msr", cpu);
++	*fd = open(dev, mode);
++
++	if (*fd < 0) {
++		snprintf(temp_string, sizeof(temp_string), "open(\"%s\")", dev);
++		perror(temp_string);
++		return -1;
++	}
++
++	if (lseek(*fd, msr, SEEK_SET) == (off_t)-1) {
++		snprintf(temp_string, sizeof(temp_string), "lseek(%lu)", msr);
++		perror(temp_string);
++		close(*fd);
++		return -1;
++	}
++
++	return 0;
++}
++
++static msr_t rdmsr_from_cpu(int cpu, unsigned long addr)
++{
++	int fd;
++	msr_t msr = { 0xffffffff, 0xffffffff };
++	uint32_t buf[2];
++	char temp_string[50];
++
++	if (open_and_seek(cpu, addr, O_RDONLY, &fd) < 0) {
++		snprintf(temp_string, sizeof(temp_string),
++			"Could not read MSR for CPU#%d", cpu);
++		perror(temp_string);
++	}
++
++	if (read(fd, buf, 8) == 8) {
++		msr.lo = buf[0];
++		msr.hi = buf[1];
++	}
++
++	close(fd);
++
++	return msr;
++}
++
++static int get_number_of_cpus(void)
++{
++	return sysconf(_SC_NPROCESSORS_ONLN);
++}
++
++static bool is_sme_supported(void)
++{
++	cpuid_result_t cpuid_regs;
++
++	if (cpuid(0x80000000) < 0x8000001f)
++		return false;
++
++	cpuid_regs = cpuid_ext(0x8000001f, 0x0);
++	return !!(cpuid_regs.eax & 1);
++}
++
++static bool is_sme_enabled(int cpunum)
++{
++	msr_t data;
++	data = rdmsr_from_cpu(cpunum, 0xC0010010);
++	return !!(data.lo & (1 << 23));
++}
++
++#endif
++
++static int print_sme(void)
++{
++	int error = -1;
++#ifndef __DARWIN__
++	int ncpus = get_number_of_cpus();
++	int i = 0;
++	bool sme_supported;
++
++	printf("\n============= Dumping AMD SME status =============\n");
++
++	if (ncpus < 1) {
++		perror("Failed to get number of CPUs");
++		error = -1;
++	} else {
++		sme_supported = is_sme_supported();
++		for (i = 0; i < ncpus ; i++) {
++
++			printf("------------- CPU %d ----------------\n", i);
++			printf("SME supported             : %s\n",
++					sme_supported ? "YES" : "NO");
++			if (sme_supported)
++				printf("SME enabled               : %s\n",
++					is_sme_enabled(i) ? "YES" : "NO");
++		}
++		error = 0;
++	}
++	printf("====================================================\n\n");
++#endif
++	return error;
++}
++
++static bool is_sev_supported(void)
++{
++	cpuid_result_t cpuid_regs;
++
++	if (cpuid(0x80000000) < 0x8000001f)
++		return false;
++
++	cpuid_regs = cpuid_ext(0x8000001f, 0x0);
++	return !!(cpuid_regs.eax & 2);
++}
++
++static bool is_sev_es_supported(void)
++{
++	cpuid_result_t cpuid_regs;
++
++	if (cpuid(0x80000000) < 0x8000001f)
++		return false;
++
++	cpuid_regs = cpuid_ext(0x8000001f, 0x0);
++	return !!(cpuid_regs.eax & 8);
++}
++
++static bool is_sev_snp_supported(void)
++{
++	cpuid_result_t cpuid_regs;
++
++	if (cpuid(0x80000000) < 0x8000001f)
++		return false;
++
++	cpuid_regs = cpuid_ext(0x8000001f, 0x0);
++	return !!(cpuid_regs.eax & 0x10);
++}
++
++static bool is_sev_enabled(int cpunum)
++{
++	msr_t data;
++
++	data = rdmsr_from_cpu(cpunum, 0xC0010131);
++	return !!(data.lo & 1);
++}
++
++static bool is_sev_es_enabled(int cpunum)
++{
++	msr_t data;
++
++	data = rdmsr_from_cpu(cpunum, 0xC0010131);
++	return !!(data.lo & 2);
++}
++
++static bool is_sev_snp_enabled(int cpunum)
++{
++	msr_t data;
++
++	data = rdmsr_from_cpu(cpunum, 0xC0010131);
++	return !!(data.lo & 4);
++}
++
++static unsigned int get_sev_max_guest_num(void)
++{
++	cpuid_result_t cpuid_regs;
++
++	cpuid_regs = cpuid_ext(0x8000001f, 0x0);
++	return cpuid_regs.ecx;
++}
++
++static unsigned int get_sev_min_asid(void)
++{
++	cpuid_result_t cpuid_regs;
++
++	cpuid_regs = cpuid_ext(0x8000001f, 0x0);
++	return cpuid_regs.edx;
++}
++
++static int print_sev(void)
++{
++	int error = -1;
++#ifndef __DARWIN__
++	int ncpus = get_number_of_cpus();
++	int i = 0;
++	bool sev_supported, sev_es_supported, sev_snp_supported;
++	unsigned int max_guest, min_asid;
++
++	printf("\n============= Dumping AMD SEV status =============\n");
++
++	if (ncpus < 1) {
++		perror("Failed to get number of CPUs");
++		error = -1;
++	} else {
++		/*
++		 * The following use CPUID, so should be the same for each core
++		 * in the scope of processor.
++		 */
++		sev_supported = is_sev_supported();
++		sev_es_supported = is_sev_es_supported();
++		sev_snp_supported = is_sev_snp_supported();
++		if (sev_supported) {
++			max_guest = get_sev_max_guest_num();
++			min_asid = get_sev_min_asid();
++		}
++
++		for (i = 0; i < ncpus ; i++) {
++			printf("------------- CPU %d ----------------\n", i);
++			printf("SEV supported             : %s\n",
++					sev_supported ? "YES" : "NO");
++			if (sev_supported) {
++				printf("Max SEV encrypted guests  : %u\n",
++					max_guest);
++				printf("Min SEV ASID              : %u\n",
++					min_asid);
++				printf("SEV enabled               : %s\n",
++					is_sev_enabled(i) ? "YES" : "NO");
++			}
++			printf("SEV-ES supported          : %s\n",
++					sev_es_supported ? "YES" : "NO");
++			if (sev_es_supported)
++				printf("SEV-ES enabled            : %s\n",
++					is_sev_es_enabled(i) ? "YES" : "NO");
++			printf("SEV-SNP supported         : %s\n",
++					sev_snp_supported ? "YES" : "NO");
++			if (sev_snp_supported)
++				printf("SEV-SNP enabled           : %s\n",
++					is_sev_snp_enabled(i) ? "YES" : "NO");
++		}
++		error = 0;
++	}
++	printf("====================================================");
++#endif
++	return error;
++}
++
++static void get_cpu_brand_string(char *cpu_string)
++{
++	u32 tmp[13];
++	cpuid_result_t res;
++	const char *str = "Unknown Processor Name";
++	int i, j;
++
++	if (cpuid(0x80000000) >= 0x80000004) {
++		j = 0;
++		for (i = 0; i < 3; i++) {
++			res = cpuid_ext(0x80000002 + i, 0x0);
++			tmp[j++] = res.eax;
++			tmp[j++] = res.ebx;
++			tmp[j++] = res.ecx;
++			tmp[j++] = res.edx;
++		}
++		tmp[12] = 0;
++		str = (const char *)tmp;
++	}
++
++	strcpy(cpu_string, str);
++}
++
++#define CPU_BRAND_STRING_LEN 48
++
++static int print_cpu_features(void)
++{
++	int error = -1;
++#ifndef __DARWIN__
++	cpuid_result_t cpuid_regs;
++
++	printf("\n============= AMD CPU features =============\n");
++
++	if (cpuid(0x80000000) >= 0x80000001) {
++		cpuid_regs = cpuid_ext(0x80000001, 0x0);
++		printf("SVM supported             : %s\n",
++			cpuid_regs.ecx & (1 << 2) ? "YES" : "NO");
++		printf("SKINIT supported          : %s\n",
++			cpuid_regs.ecx & (1 << 12) ? "YES" : "NO");
++	}
++
++	error = 0;
++
++	printf("====================================================\n");
++#endif
++	return error;
++}
++
++int print_cpu_info(void)
++{
++	int ret;
++	char brand_string[CPU_BRAND_STRING_LEN + 1];
++
++	get_cpu_brand_string(brand_string);
++	printf("CPU brand string: %s\n", brand_string);
++
++	ret = print_cpu_features();
++	ret += print_sme();
++	ret += print_sev();
++
++	return ret;
++}
++
++static const msr_entry_t common_msrs[] = {
++	{ 0x001b, "IA32_APIC_BASE" },
++	{ 0x008b, "MICROCODE_PATCH_LEVEL" },
++	{ 0x00fe, "IA32_MTRRCAP" },
++	{ 0x0179, "IA32_MCG_CAP" },
++	{ 0x017a, "IA32_MCG_STATUS" },
++	{ 0x017b, "IA32_MCG_CONTROL" },
++	{ 0x01d9, "IA32_DEBUGCTL" },
++	{ 0x0200, "IA32_MTRR_PHYSBASE0" },
++	{ 0x0201, "IA32_MTRR_PHYSMASK0" },
++	{ 0x0202, "IA32_MTRR_PHYSBASE1" },
++	{ 0x0203, "IA32_MTRR_PHYSMASK1" },
++	{ 0x0204, "IA32_MTRR_PHYSBASE2" },
++	{ 0x0205, "IA32_MTRR_PHYSMASK2" },
++	{ 0x0206, "IA32_MTRR_PHYSBASE3" },
++	{ 0x0207, "IA32_MTRR_PHYSMASK3" },
++	{ 0x0208, "IA32_MTRR_PHYSBASE4" },
++	{ 0x0209, "IA32_MTRR_PHYSMASK4" },
++	{ 0x020a, "IA32_MTRR_PHYSBASE5" },
++	{ 0x020b, "IA32_MTRR_PHYSMASK5" },
++	{ 0x020c, "IA32_MTRR_PHYSBASE6" },
++	{ 0x020d, "IA32_MTRR_PHYSMASK6" },
++	{ 0x020e, "IA32_MTRR_PHYSBASE7" },
++	{ 0x020f, "IA32_MTRR_PHYSMASK7" },
++	{ 0x0250, "IA32_MTRR_FIX64K_00000" },
++	{ 0x0258, "IA32_MTRR_FIX16K_80000" },
++	{ 0x0259, "IA32_MTRR_FIX16K_A0000" },
++	{ 0x0268, "IA32_MTRR_FIX4K_C0000" },
++	{ 0x0269, "IA32_MTRR_FIX4K_C8000" },
++	{ 0x026a, "IA32_MTRR_FIX4K_D0000" },
++	{ 0x026b, "IA32_MTRR_FIX4K_D8000" },
++	{ 0x026c, "IA32_MTRR_FIX4K_E0000" },
++	{ 0x026d, "IA32_MTRR_FIX4K_E8000" },
++	{ 0x026e, "IA32_MTRR_FIX4K_F0000" },
++	{ 0x026f, "IA32_MTRR_FIX4K_F8000" },
++	{ 0x0277, "IA32_PAT" },
++	{ 0x02ff, "IA32_MTRR_DEF_TYPE" },
++	{ 0xc0000080, "EFER" },
++	{ 0xc0010010, "SYS_CFG" },
++	{ 0xc0010015, "HWCR" },
++	{ 0xc0010016, "IORR_BASE0" },
++	{ 0xc0010017, "IORR_MASK0" },
++	{ 0xc0010018, "IORR_BASE1" },
++	{ 0xc0010019, "IORR_MASK1" },
++	{ 0xc001001a, "TOP_MEM" },
++	{ 0xc001001d, "TOM2" },
++	{ 0xc0010030, "PROCESSOR_NAME_STRING0" },
++	{ 0xc0010031, "PROCESSOR_NAME_STRING1" },
++	{ 0xc0010032, "PROCESSOR_NAME_STRING2" },
++	{ 0xc0010033, "PROCESSOR_NAME_STRING3" },
++	{ 0xc0010034, "PROCESSOR_NAME_STRING4" },
++	{ 0xc0010035, "PROCESSOR_NAME_STRING5" },
++	{ 0xc0010050, "SMI_ON_IO_TRAP0" },
++	{ 0xc0010051, "SMI_ON_IO_TRAP1" },
++	{ 0xc0010052, "SMI_ON_IO_TRAP2" },
++	{ 0xc0010053, "SMI_ON_IO_TRAP3" },
++	{ 0xc0010054, "SMI_ON_IO_TRAP_CTL_STS" },
++	{ 0xc0010056, "SMI_TRIGGER_IO_CYCLE" },
++	{ 0xc0010058, "MMCONF_BASE_ADDR" },
++	{ 0xc0010061, "PSTATE_CURRENT_LIMIT" },
++	{ 0xc0010062, "PSTATE_CNTRL" },
++	{ 0xc0010063, "PSTATE_STATUS" },
++	{ 0xc0010064, "PSTATE0_DEF" },
++	{ 0xc0010065, "PSTATE1_DEF" },
++	{ 0xc0010066, "PSTATE2_DEF" },
++	{ 0xc0010067, "PSTATE3_DEF" },
++	{ 0xc0010068, "PSTATE4_DEF" },
++	{ 0xc0010069, "PSTATE5_DEF" },
++	{ 0xc001006a, "PSTATE6_DEF" },
++	{ 0xc001006b, "PSTATE7_DEF" },
++	{ 0xc0010073, "CSTATE_BASE_ADDR" },
++	{ 0xc0010074, "CPU_WDT_CFG" },
++	{ 0xc0010111, "SMM_BASE" },
++	{ 0xc0010112, "SMM_TSEG_BASE" },
++	{ 0xc0010113, "SMM_TSEG_MASK" },
++	{ 0xc0010118, "SVM_LOCK_KEY" },
++	{ 0xc0010119, "SMM_LOCK_KEY" },
++	{ 0xc0010131, "SEV_STATUS" },
++	{ 0xc0010140, "OSVW_ID_LENGTH" },
++	{ 0xc0010141, "OSVW_STATUS" },
++	{ 0xc0010292, "PWR_MNGMNT_MISC" },
++	{ 0xc0010293, "HW_PSTATE_STATUS" },
++	{ 0xc0010294, "CSTATE_POLICY" },
++	{ 0xc0010296, "CSTATE_CONFIG" },
++	{ 0xc0010297, "PWR_MNGMNT_DEFAULT" },
++	{ 0xc0010299, "RAPL_PWR_UNIT" },
++	{ 0xc001029a, "CORE_ENERGY_STS" },
++	{ 0xc001029b, "PKG_ENERGY_STS" },
++	{ 0xc00102b0, "CPPC_CAP1" },
++	{ 0xc00102b1, "CPPC_ENABLE" },
++	{ 0xc00102b2, "CPPC_CAP2" },
++	{ 0xc00102b3, "CPPC_REQUEST" },
++	{ 0xc00102b4, "CPPC_STATUS" },
++	{ 0xc0011002, "CPUID_7_FEATURES" },
++	{ 0xc0011003, "CPUID_PWR_THERM" },
++	{ 0xc0011004, "CPUID_FEATURES" },
++	{ 0xc0011005, "CPUID_EXT_FEATURES" },
++	{ 0xc001100c, "NODE_ID/SCRATCH" },
++	{ 0xC0011020, "LS_CFG" },
++	{ 0xC0011021, "IC_CFG" },
++	{ 0xc0011022, "DC_CFG" },
++	{ 0xc0011023, "TW_CFG" },
++	{ 0xc0011028, "FP_CFG" },
++	{ 0xc0011029, "ME_CFG" },
++	{ 0xc001102a, "BU_CFG2" },
++	{ 0xc001102b, "L2_PFCFG" },
++	{ 0xC001102d, "LS_CFG2" },
++	{ 0xc001102e, "BP_CFG" },
++	{ 0xc00110a2, "PSP_ADDR" },
++};
++
++int print_amd_msrs(void)
++{
++	unsigned int i, id;
++	msr_t msr;
++
++	typedef struct {
++		unsigned int model;
++		const msr_entry_t *global_msrs;
++		unsigned int num_global_msrs;
++	} cpu_t;
++
++	cpu_t cpulist[] = {
++		{ CPUID_TURIN_C1, common_msrs, ARRAY_SIZE(common_msrs) },
++	};
++
++	cpu_t *cpu = NULL;
++
++	/* Get CPU family, model and stepping */
++	id = cpuid(1);
++	for (i = 0; i < ARRAY_SIZE(cpulist); i++) {
++		if(cpulist[i].model == id) {
++			cpu = &cpulist[i];
++			break;
++		}
++	}
++
++	if (!cpu) {
++		printf("Error: Dumping MSRs on this CPU (0x%06x) is not (yet) supported.\n", id);
++		return -1;
++	}
++
++#ifndef __DARWIN__
++	fd_msr = open("/dev/cpu/0/msr", O_RDWR);
++	if (fd_msr < 0) {
++		perror("Error while opening /dev/cpu/0/msr");
++		printf("Did you run 'modprobe msr'?\n");
++		return -1;
++	}
++#endif
++
++	printf("\n===================== MSRs =====================\n");
++
++	for (i = 0; i < cpu->num_global_msrs; i++) {
++		msr = rdmsr(cpu->global_msrs[i].number);
++		printf(" MSR 0x%08X = 0x%08X:0x%08X (%s)\n",
++		       cpu->global_msrs[i].number, msr.hi, msr.lo,
++		       cpu->global_msrs[i].name);
++	}
++
++#ifndef __DARWIN__
++	close(fd_msr);
++
++	if (msr_readerror)
++		printf("\n(*) Some MSRs could not be read. The marked values are unreliable.\n");
++#endif
++	return 0;
++}
+diff --git a/util/amdtool/description.md b/util/amdtool/description.md
+new file mode 100644
+index 000000000000..ad191e3afe1c
+--- /dev/null
++++ b/util/amdtool/description.md
+@@ -0,0 +1,2 @@
++Provides information about the AMD CPU/chipset hardware configuration
++(register contents, MSRs, etc). `C`
+diff --git a/util/amdtool/espi.c b/util/amdtool/espi.c
+new file mode 100644
+index 000000000000..397f9fd343c0
+--- /dev/null
++++ b/util/amdtool/espi.c
+@@ -0,0 +1,199 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <inttypes.h>
++#include <commonlib/helpers.h>
++#include "amdtool.h"
++#include "smn.h"
++
++#define AMD_FCH_SPIBAR_OFFSET	0xa0
++
++#define SPIBAR_ESPI_MMIO_OFFSET	0x10000
++#define SPI_MMIO_BASE		0xfec10000
++#define ESPI0_MMIO_BASE		0xfec20000
++#define ESPI1_MMIO_BASE		0xfec30000
++#define ESPI_MMIO_SIZE		0x10000
++
++#define BRH_ESPI0_SMN_BASE	0x02DC5000
++#define BRH_ESPI1_SMN_BASE	0x02DCA000
++
++static const io_register_t kunlun_espi_cfg_registers[] = {
++	{0x2C, 4, "MASTER_CAP"},
++	{0x30, 4, "GLBL_CTL0"},
++	{0x34, 4, "GLBL_CTL1"},
++	{0x40, 4, "SLAVE0_DECODE_EN"},
++	{0x44, 2, "IO_BASE[0]"},
++	{0x46, 2, "IO_BASE[1]"},
++	{0x48, 2, "IO_BASE[2]"},
++	{0x4A, 2, "IO_BASE[3]"},
++	{0x4C, 1, "IO_SIZE[0]"},
++	{0x4D, 1, "IO_SIZE[1]"},
++	{0x4E, 1, "IO_SIZE[2]"},
++	{0x4F, 1, "IO_SIZE[3]"},
++	{0x50, 4, "MMIO_BASE[0]"},
++	{0x54, 4, "MMIO_BASE[1]"},
++	{0x58, 4, "MMIO_BASE[2]"},
++	{0x5C, 4, "MMIO_BASE[3]"},
++	{0x60, 2, "MMIO_SIZE[0]"},
++	{0x62, 2, "MMIO_SIZE[1]"},
++	{0x64, 2, "MMIO_SIZE[2]"},
++	{0x66, 2, "MMIO_SIZE[3]"},
++	{0x68, 4, "SLAVE0_CFG"},
++	{0x6C, 4, "SLAVE0_INT_EN"},
++	{0x70, 4, "SLAVE0_INT_STS"},
++	{0x80, 2, "IO_BASE[4]"},
++	{0x82, 2, "IO_BASE[5]"},
++	{0x84, 2, "IO_BASE[6]"},
++	{0x86, 2, "IO_BASE[7]"},
++	{0x88, 1, "IO_SIZE[4]"},
++	{0x89, 1, "IO_SIZE[5]"},
++	{0x8A, 1, "IO_SIZE[6]"},
++	{0x8B, 1, "IO_SIZE[7]"},
++	{0x8C, 2, "IO_BASE[8]"},
++	{0x8E, 2, "IO_BASE[9]"},
++	{0x90, 2, "IO_BASE[10]"},
++	{0x92, 2, "IO_BASE[11]"},
++	{0x94, 1, "IO_SIZE[8]"},
++	{0x95, 1, "IO_SIZE[9]"},
++	{0x96, 1, "IO_SIZE[10]"},
++	{0x97, 1, "IO_SIZE[11]"},
++	{0xA8, 4, "SLAVE0_RXVW_MISC_CNTL"},
++	{0xAC, 4, "SLAVE0_RXVW_POLARITY"},
++	{0xB0, 2, "IO_BASE[12]"},
++	{0xB2, 2, "IO_BASE[13]"},
++	{0xB4, 2, "IO_BASE[14]"},
++	{0xB6, 2, "IO_BASE[15]"},
++	{0xB8, 1, "IO_SIZE[12]"},
++	{0xB9, 1, "IO_SIZE[13]"},
++	{0xBA, 1, "IO_SIZE[14]"},
++	{0xBB, 1, "IO_SIZE[15]"},
++	{0xBC, 4, "MMIO_BASE[4]"},
++	{0xC0, 4, "MMIO_SIZE[4]"},
++	{0xC4, 4, "MMIO_CPU_TEMP"},
++	{0xC8, 4, "MMIO_RTC_TIME"},
++	{0xCC, 4, "ESPI_MISC_CTL1"},
++};
++
++static bool use_smn = false;
++static uint32_t espi_smn_addr[2] = { 0, 0 };
++static volatile uint8_t *espibar;
++
++static uint32_t espi_read32(const io_register_t *reg, size_t espi_cntrlr)
++{
++	if (use_smn)
++		return smn_read32(espi_smn_addr[espi_cntrlr] + reg->addr);
++	else
++		return read32(espibar + (espi_cntrlr * ESPI_MMIO_SIZE) + reg->addr);
++}
++
++static uint32_t espi_read16(const io_register_t *reg, size_t espi_cntrlr)
++{
++	if (use_smn)
++		return smn_read16(espi_smn_addr[espi_cntrlr] + reg->addr);
++	else
++		return read16(espibar + (espi_cntrlr * ESPI_MMIO_SIZE) + reg->addr);
++}
++
++static uint32_t espi_read8(const io_register_t *reg, size_t espi_cntrlr)
++{
++	if (use_smn)
++		return smn_read8(espi_smn_addr[espi_cntrlr] + reg->addr);
++	else
++		return read8(espibar + (espi_cntrlr * ESPI_MMIO_SIZE) + reg->addr);
++}
++
++int print_espi(struct pci_dev *sb)
++{
++	size_t i, espi, num_espi, cfg_registers_size = 0;
++	uint32_t spibar_phys, spibar_mask;
++	const io_register_t *cfg_registers;
++	int smbus_rev = 0;
++
++	printf("\n========== eSPI ==========\n\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			num_espi = 2;
++			cfg_registers = kunlun_espi_cfg_registers;
++			cfg_registers_size = ARRAY_SIZE(kunlun_espi_cfg_registers);
++			espi_smn_addr[0] = BRH_ESPI0_SMN_BASE;
++			espi_smn_addr[1] = BRH_ESPI1_SMN_BASE;
++			spibar_mask = 0xffffff00;
++			break;
++		default:
++			printf("Error: Dumping eSPI on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping eSPI on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	spibar_phys = pci_read_long(sb, AMD_FCH_SPIBAR_OFFSET);
++	if ((spibar_phys & spibar_mask) == 0) {
++		perror("Error SPIBAR not programmed");
++		return 1;
++	}
++
++	if (spibar_phys == UINT32_MAX) {
++		spibar_phys = SPI_MMIO_BASE;
++	}
++
++	spibar_phys &= spibar_mask;
++
++	espibar = map_physical(spibar_phys + SPIBAR_ESPI_MMIO_OFFSET,
++				ESPI_MMIO_SIZE * num_espi);
++	if (espibar == NULL) {
++		perror("Error mapping ESPI BAR, trying SMN");
++		use_smn = true;
++	}
++
++	for (espi = 0; espi < num_espi; espi++) {
++		printf("\n---------- eSPI %lu ----------\n\n", espi);
++		if (use_smn)
++			printf("ESPI%lu 0x%08x (SMN)\n\n", espi, espi_smn_addr[espi]);
++		else
++			printf("ESPI%lu 0x%08x (MEM)\n\n", espi,
++				(uint32_t)(spibar_phys + SPIBAR_ESPI_MMIO_OFFSET + (ESPI_MMIO_SIZE * espi)));
++
++		for (i = 0; i < cfg_registers_size; i++) {
++			switch (cfg_registers[i].size) {
++			case 4:
++				printf("0x%04x: 0x%08x (%s)\n",
++					cfg_registers[i].addr,
++					espi_read32(&cfg_registers[i], espi),
++					cfg_registers[i].name);
++				break;
++			case 2:
++				printf("0x%04x: 0x%04x     (%s)\n",
++					cfg_registers[i].addr,
++					espi_read16(&cfg_registers[i], espi),
++					cfg_registers[i].name);
++				break;
++			case 1:
++				printf("0x%04x: 0x%02x       (%s)\n",
++					cfg_registers[i].addr,
++					espi_read8(&cfg_registers[i], espi),
++					cfg_registers[i].name);
++				break;
++			default:
++				printf("Error: register size %d not implemented.\n",
++					cfg_registers[i].size);
++				break;
++			}
++		}
++	}
++
++	return 0;
++}
+diff --git a/util/amdtool/gpio.c b/util/amdtool/gpio.c
+new file mode 100644
+index 000000000000..c2e038950a78
+--- /dev/null
++++ b/util/amdtool/gpio.c
+@@ -0,0 +1,394 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdbool.h>
++#include <stdio.h>
++#include "acpimmio.h"
++#include "amdtool.h"
++#include "smn.h"
++
++#define AMD_IOMUX_MAX_FUNC_COUNT	4
++#define AMD_IOMUX_SIZE			0x100
++#define AMD_GPIO_BANK_SIZE		(0x100 / 4)
++
++#define AMD_BRH_IOMUX_SMN_BASE		0x02D01000
++
++static uint8_t *iomux_base;
++static uint32_t *gpio_base;
++
++struct gpio_group {
++	const uint8_t *iomux_defaults;
++	const char *const *gpio_names;
++	const unsigned int gpio_bank_count;
++	const uint32_t *gpio_defaults;
++	const uint16_t *special_gpio_regs;
++	const uint16_t special_gpio_regs_size;
++	const uint16_t acpimmio_gpio_offset;
++	const uint16_t acpimmio_iomux_offset;
++};
++
++/* For better readiability and less SLOC, we override the initialized values.
++ * Hide the warnings, as they will overflow the screen and make it harder to
++ * focus on real compielr errors and warnings.
++ */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Woverride-init"
++
++const char *const kunlun_iomux_gpio_names[] = {
++	[0 ... AMD_IOMUX_MAX_FUNC_COUNT * AMD_IOMUX_SIZE - 1] = "",
++	[0x00 * 4] = "PWR_BTN_L",		"GPIO0",	"GPIO0",	"GPIO0",
++	[0x01 * 4] = "SYS_RESET_L",		"GPIO1",	"GPIO1",	"GPIO1",
++	[0x02 * 4] = "WAKE_L",			"GPIO2",	"GPIO2",	"GPIO2",
++	[0x03 * 4] = "GPIO3",			"GPIO3",	"GPIO3",	"GPIO3",
++	[0x04 * 4] = "GPIO4",			"SATA_ACT_L",	"GPIO4",	"GPIO4",
++	[0x05 * 4] = "GPIO5",			"DEVSLP0",	"GPIO5",	"GPIO5",
++	[0x06 * 4] = "GPIO6",			"DEVSLP1",	"GPIO6",	"GPIO6",
++	[0x07 * 4] = "GPIO7",			"GPIO7",	"GPIO7",	"GPIO7",
++	[0x0C * 4] = "PWRGD_OUT",		"GPIO12",	"GPIO12",	"GPIO12",
++	[0x0D * 4] = "I2C4_SCL",		"GPIO13",	"GPIO13",	"GPIO13",
++	[0x0E * 4] = "I2C4_SDA",		"GPIO14",	"GPIO14",	"GPIO14",
++	[0x10 * 4] = "USB10_OC0_L",		"GPIO16",	"GPIO16",	"GPIO16",
++	[0x11 * 4] = "USB11_OC1_L",		"GPIO17",	"GPIO17",	"GPIO17",
++	[0x13 * 4] = "I2C5_SCL",		"SMBUS1_SCL",	"GPIO19",	"GPIO19",
++	[0x14 * 4] = "I2C5_SDA",		"SMBUS1_SDA",	"GPIO20",	"GPIO20",
++	[0x15 * 4] = "GPIO21",			"GPIO21",	"GPIO21",	"n/a",
++	[0x16 * 4] = "GPIO22",			"n/a",		"GPIO22",	"GPIO22",
++	[0x17 * 4] = "ESPI_RSTOUT_L",		"GPIO23",	"GPIO23",	"GPIO23",
++	[0x18 * 4] = "SMERR_L",			"GPIO24",	"GPIO24",	"GPIO24",
++	[0x1A * 4] = "PCIE_RST_L",		"GPIO26",	"GPIO26",	"GPIO26",
++	[0x1C * 4] = "X48M_OUT",		"GPIO28",	"GPIO28",	"GPIO28",
++	[0x4A * 4] = "ESPI_CLK2",		"GPIO74",	"GPIO74"	"GPIO74",
++	[0x4B * 4] = "ESPI_CLK1",		"GPIO75",	"GPIO75",	"n/a",
++	[0x4C * 4] = "GPIO76",			"SPI_TPM_CS_L",	"GPIO76",	"GPIO76",
++	[0x56 * 4] = "GPIO86",			"GPIO86",	"LPC_SMI_L",	"GPIO86",
++	[0x57 * 4] = "GPIO87",			"n/a",		"GPIO87",	"GPIO87",
++	[0x58 * 4] = "GPIO88",			"n/a",		"GPIO88",	"GPIO88",
++	[0x59 * 4] = "GENINT1_L",		"PM_INTR_L",	"GPIO89",	"GPIO89",
++	[0x68 * 4] = "GPIO104",			"GPIO104",	"n/a",		"GPIO104",
++	[0x69 * 4] = "GPIO105",			"GPIO105",	"n/a",		"GPIO105",
++	[0x6A * 4] = "GPIO106",			"GPIO106",	"n/a",		"GPIO106",
++	[0x6B * 4] = "GPIO107",			"GPIO107",	"n/a",		"GPIO107",
++	[0x6C * 4] = "ESPI0_ALERT_D1",		"GPIO108",	"n/a",		"GPIO108",
++	[0x6D * 4] = "GPIO109",			"GPIO109",	"n/a",		"GPIO109",
++	[0x6E * 4] = "ESPI1_ALERT_D1",		"GPIO110",	"GPIO110",	"GPIO110",
++	[0x73 * 4] = "GPIO115",			"CLK_REQ1_L",	"GPIO115",	"GPIO115",
++	[0x74 * 4] = "GPIO116",			"CLK_REQ2_L",	"GPIO116",	"GPIO116",
++	[0x75 * 4] = "ESPI_CLK0",		"GPIO117",	"GPIO117",	"GPIO117",
++	[0x76 * 4] = "SPI_CS0_L",		"GPIO118",	"GPIO118",	"GPIO118",
++	[0x77 * 4] = "SPI_CS1_L",		"GPIO119",	"GPIO119",	"GPIO119",
++	[0x78 * 4] = "ESPI0_D0/SPI0_D0",	"GPIO120",	"GPIO120",	"GPIO120",
++	[0x79 * 4] = "ESPI0_D1/SPI0_D1",	"GPIO121",	"GPIO121",	"GPIO121",
++	[0x7A * 4] = "ESPI0_D2/SPI0_D2",	"GPIO122",	"GPIO122",	"GPIO122",
++	[0x7B * 4] = "ESPI0_D3/SPI0_D3",	"GPIO123",	"GPIO123",	"GPIO123",
++	[0x7C * 4] = "ESPI_CS0_L",		"GPIO124",	"GPIO124",	"GPIO124",
++	[0x7D * 4] = "ESPI_CS1_L",		"GPIO125",	"GPIO125",	"GPIO125",
++	[0x7E * 4] = "SPI_CS2_L",		"GPIO126",	"GPIO126",	"GPIO126",
++	[0x81 * 4] = "ESPI_RSTIN_L",		"KBRST_L",	"GPIO129",	"GPIO129",
++	[0x83 * 4] = "ESPI1_D0/SPI1_D0",	"GPIO131",	"GPIO131",	"GPIO131",
++	[0x84 * 4] = "ESPI1_D1/SPI1_D1",	"GPIO132",	"GPIO132",	"GPIO132",
++	[0x85 * 4] = "ESPI1_D2/SPI1_D2",	"GPIO133",	"GPIO133",	"GPIO133",
++	[0x86 * 4] = "ESPI1_D3/SPI1_D3",	"GPIO134",	"GPIO134",	"GPIO134",
++	[0x87 * 4] = "UART0_CTS_L",		"UART2_RXD",	"GPIO135",	"GPIO135",
++	[0x88 * 4] = "UART0_RXD",		"GPIO136",	"GPIO136",	"GPIO136",
++	[0x89 * 4] = "UART0_RTS_L",		"UART2_TXD",	"GPIO137",	"GPIO137",
++	[0x8A * 4] = "UART0_TXD",		"GPIO138",	"GPIO138",	"GPIO138",
++	[0x8B * 4] = "UART0_INTR",		"GPIO139",	"GPIO139",	"GPIO139",
++	[0x8D * 4] = "UART1_RXD",		"GPIO141",	"GPIO141",	"GPIO141",
++	[0x8E * 4] = "UART1_TXD",		"GPIO142",	"GPIO142",	"GPIO142",
++	[0x91 * 4] = "I3C0_SCL",		"I2C0_SCL",	"SMBUS0_SCL",	"GPIO145",
++	[0x92 * 4] = "I3C0_SDA",		"I2C0_SDA",	"SMBUS0_SDA",	"GPIO146",
++	[0x93 * 4] = "I3C1_SCL",		"I2C1_SCL",	"GPIO147",	"GPIO147",
++	[0x94 * 4] = "I3C1_SDA",		"I2C1_SDA",	"GPIO148",	"GPIO148",
++	[0x95 * 4] = "I3C2_SCL",		"I2C2_SCL",	"GPIO149",	"GPIO149",
++	[0x96 * 4] = "I3C2_SDA",		"I2C2_SDA",	"GPIO150",	"GPIO150",
++	[0x97 * 4] = "I3C3_SCL",		"I2C3_SCL",	"GPIO151",	"GPIO151",
++	[0x98 * 4] = "I3C3_SDA",		"I2C3_SDA",	"GPIO152",	"GPIO152",
++};
++
++const uint8_t kunlun_iomux_group_defaults[] = {
++	[0 ...  AMD_IOMUX_SIZE - 1] = 0x00,
++	[0x13] = 0x01,
++	[0x14] = 0x01,
++	[0x87] = 0x02,
++	[0x89] = 0x02,
++	[0x8A] = 0x01,
++	[0x8E] = 0x01,
++};
++
++const uint32_t kunlun_gpio_group_defaults[] = {
++	[0 ...  4 * AMD_GPIO_BANK_SIZE - 1] = 0,
++	[0x0000]     = 0x00140000, 0x00140000, 0x00140000, 0x00140000,
++	[0x0010 / 4] = 0x00140000, 0x00240000, 0x00240000, 0x00240000,
++	[0x0020 / 4] = 0x00240000, 0x00240000, 0x00140000, 0x00140000,
++	[0x0030 / 4] = 0x00040000, 0x00040000, 0x00040000, 0x00000000,
++	[0x0040 / 4] = 0x00140000, 0x00140000, 0x00140000, 0x00040000,
++	[0x0050 / 4] = 0x00040000, 0x00240000, 0x00240000, 0x00140000,
++	[0x0060 / 4] = 0x00140000, 0x00000000, 0x00040000, 0x00240000,
++	[0x0070 / 4] = 0x00240000, 0x00140000, 0x00140000, 0x00140000,
++	[0x0080 / 4] = 0x00240000, 0x00000000, 0x00000000, 0x00000000,
++	[0x00A0 / 4] = 0x00240000, 0x00000000, 0x00140000, 0x00000000,
++	[0x0120 / 4] = 0x00000000, 0x00000000, 0x00240000, 0x00240000,
++	[0x0130 / 4] = 0x00140000, 0x00000000, 0x00000000, 0x00000000,
++	[0x0150 / 4] = 0x00000000, 0x00000000, 0x00240000, 0x00240000,
++	[0x0160 / 4] = 0x00240000, 0x00140000, 0x00000001, 0x00000000,
++	[0x01A0 / 4] = 0x00240000, 0x00240000, 0x00240000, 0x00240000,
++	[0x01B0 / 4] = 0x00140000, 0x00240000, 0x00000000, 0x00000000,
++	[0x01C0 / 4] = 0x00000000, 0x00000000, 0x00000000, 0x00140000,
++	[0x01D0 / 4] = 0x00140000, 0x00240000, 0x00140000, 0x00140000,
++	[0x01E0 / 4] = 0x00140000, 0x00140000, 0x00140000, 0x00140000,
++	[0x01F0 / 4] = 0x00140000, 0x00140000, 0x00140000, 0x00000000,
++	[0x0200 / 4] = 0x00000000, 0x00140000, 0x00000000, 0x00140000,
++	[0x0210 / 4] = 0x00140000, 0x00140000, 0x00140000, 0x00240000,
++	[0x0220 / 4] = 0x00240000, 0x00140000, 0x00140000, 0x00240000,
++	[0x0230 / 4] = 0x00000000, 0x00240000, 0x00140000, 0x00000000,
++	[0x0240 / 4] = 0x00040000, 0x00040000, 0x00040000, 0x00040000,
++	[0x0250 / 4] = 0x00040000, 0x00040000, 0x00040000, 0x00040000,
++	[0x0260 / 4] = 0x00040000, 0x00000000, 0x00000000, 0x00000000,
++};
++
++
++#pragma GCC diagnostic pop
++
++const uint16_t kunlun_special_gpio_regs[] = {
++	0x0fc, 0x1fc, 0x2f0, 0x02f4, 0x2f8, 0x2fc
++};
++
++const struct gpio_group kunlun_gpio_group = {
++	.iomux_defaults		= kunlun_iomux_group_defaults,
++	.gpio_names		= kunlun_iomux_gpio_names,
++	.gpio_bank_count	= 4,
++	.gpio_defaults		= kunlun_gpio_group_defaults,
++	.special_gpio_regs	= kunlun_special_gpio_regs,
++	.special_gpio_regs_size = ARRAY_SIZE(kunlun_special_gpio_regs),
++	.acpimmio_gpio_offset	= 0x1500,
++	.acpimmio_iomux_offset	= 0x0d00,
++};
++
++static const io_register_t fch_gpio_reg_fields[] = {
++	{  0, 4, "DebounceTmrOut" },
++	{  4, 1, "DebounceTmrOutUnit" },
++	{  5, 2, "DebounceCntrl." },
++	{  7, 1, "DebounceTmrLarge." },
++	{  9, 3, "Trigger Type" },
++	{ 11, 1, "Enable interrupt status" },
++	{ 12, 1, "Enable interrupt delivery" },
++	{ 13, 3, "Wake Control" },
++	{ 16, 1, "Pin Status" },
++	{ 17, 2, "DrvStrengthSel" },
++	{ 19, 1, "Reserved" },
++	{ 20, 1, "Pull Up Enable" },
++	{ 21, 1, "Pull Down Enable" },
++	{ 22, 1, "Output Value" },
++	{ 23, 1, "Output Enable" },
++	{ 24, 1, "SW Control In" },
++	{ 25, 1, "SW Control Enable" },
++	{ 25, 1, "RX Disable" },
++	{ 27, 1, "Reserved" },
++	{ 28, 1, "Interrupt Status" },
++	{ 29, 1, "Wake Status" },
++	{ 30, 1, "Less2SecSts" },
++	{ 31, 1, "Less10SecSts" },
++};
++
++const char * const drive_strength[] = {
++	"Unsupported",
++	"60 Ohms",
++	"40 Ohms",
++	"80 Ohms"
++};
++
++const char * const wake_cntrl[] = {
++	"S0i3",
++	"S3",
++	"S4/S5"
++};
++
++const char * const debounce_cntrl[] = {
++	"No debounce",
++	"Preserve low glitch",
++	"Preserve high glitch",
++	"Remove glitch"
++};
++
++const char * const trigger_type[] = {
++	[0] = "High edge",
++	[1] = "High level",
++	[2] = "Low edge",
++	[3] = "Low level",
++	[4] = "Both edges",
++	[5 ... 8] = "Reserved",
++};
++
++static void print_iomux_reg(uint16_t addr, uint8_t reg, const char *const *gpio_names)
++{
++	printf("IOMUXx%02x: 0x%02x       (%s)\n",
++		addr, reg, gpio_names[addr * 4 + reg]);
++}
++
++static void print_iomux_diff(const uint8_t reg, const uint8_t def, const uint8_t diff,
++			     const char *const *gpio_names)
++{
++	printf("IOMUXx%02x: 0x%02x       (%s) DEFAULT\n",
++		reg, def, gpio_names[reg * 4 + def]);
++	printf("IOMUXx%02x: 0x%02x       DIFF\n", reg, diff);
++}
++
++static void print_gpio_reg(uint16_t addr, uint32_t reg, bool verbose)
++{
++	size_t i;
++	const char *attr;
++
++	printf("GPIOx%04x: 0x%08"PRIx32"\n", addr * 4, reg);
++
++	if (!verbose)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(fch_gpio_reg_fields); i++) {
++		uint32_t val = reg >> fch_gpio_reg_fields[i].addr;
++		val &= ((1 << fch_gpio_reg_fields[i].size) - 1);
++		switch(i) {
++		case 2: attr = debounce_cntrl[val]; break;
++		case 4: attr = trigger_type[val]; break;
++		case 7: attr = wake_cntrl[val]; break;
++		case 9: attr = drive_strength[val]; break;
++		default: attr = NULL; break;
++		}
++		if (attr)
++			printf("0x%04x = %s (%s)\n", val, fch_gpio_reg_fields[i].name, attr);
++		else
++			printf("0x%04x = %s\n", val, fch_gpio_reg_fields[i].name);
++	}
++}
++
++static void print_gpio_diff(const uint16_t reg, const uint32_t def, const uint32_t diff)
++{
++	printf("GPIOx%04x: 0x%08x       DEFAULT\n", reg * 4, def);
++	printf("GPIOx%04x: 0x%08x       DIFF\n", reg * 4, diff);
++}
++
++static bool is_special_gpio_register(uint16_t reg, const struct gpio_group *sb_gpio_group)
++{
++	size_t i;
++
++	for (i = 0; i < sb_gpio_group->special_gpio_regs_size; i++) {
++		if (reg == sb_gpio_group->special_gpio_regs[i])
++			return true;
++	}
++
++	return false;
++}
++
++int print_gpios(struct pci_dev *sb, int show_all, int show_diffs)
++{
++	size_t i;
++	const struct gpio_group *sb_gpio_group = NULL;
++	const uint8_t *acpi_mmio_bar;
++	uint32_t acpi_mmio_smn_bar;
++	uint32_t gpio_reg, gpio_diff;
++	uint8_t iomux_reg, iomux_diff;
++	int smbus_rev;
++	bool use_smn = false;
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			sb_gpio_group = &kunlun_gpio_group;
++			acpi_mmio_smn_bar = AMD_BRH_IOMUX_SMN_BASE;
++			use_smn = true;
++			break;
++		default:
++			printf("Error: Dumping GPIOs on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping GPIOs on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	if (show_diffs && !show_all)
++		printf("\n========== GPIO DIFFS ===========\n\n");
++	else
++		printf("\n============= GPIOS =============\n\n");
++
++	acpi_mmio_bar = get_acpi_mmio_bar(sb);
++
++	if (!acpi_mmio_bar && !use_smn)
++		return 1;
++
++	if (use_smn) {
++		iomux_base = (uint8_t *)(uintptr_t)(acpi_mmio_smn_bar + sb_gpio_group->acpimmio_iomux_offset);
++		gpio_base = (uint32_t *)(uintptr_t)(acpi_mmio_smn_bar + sb_gpio_group->acpimmio_gpio_offset);
++
++		printf("ACPI MMIO IOMUX 0x%08x (SMN)\n\n", acpi_mmio_smn_bar + sb_gpio_group->acpimmio_iomux_offset);
++		printf("ACPI MMIO GPIO 0x%08x (SMN)\n\n", acpi_mmio_smn_bar + sb_gpio_group->acpimmio_gpio_offset);
++	} else {
++		iomux_base = (uint8_t *)(acpi_mmio_bar + sb_gpio_group->acpimmio_iomux_offset);
++		gpio_base = (uint32_t *)(acpi_mmio_bar + sb_gpio_group->acpimmio_gpio_offset);
++
++		printf("ACPI MMIO IOMUX 0x%08lx (MEM)\n\n", (uintptr_t)acpi_mmio_bar + sb_gpio_group->acpimmio_iomux_offset);
++		printf("ACPI MMIO GPIO 0x%08lx (MEM)\n\n", (uintptr_t)acpi_mmio_bar + sb_gpio_group->acpimmio_gpio_offset);
++	}
++
++
++	for (i = 0; i < AMD_IOMUX_SIZE; i++) {
++		if (use_smn)
++			iomux_reg = smn_read8((uint32_t)(uintptr_t)(iomux_base + i)) & 3;
++		else
++			iomux_reg = read8(iomux_base + i) & 3;
++
++		if (show_all)
++			print_iomux_reg(i, iomux_reg, sb_gpio_group->gpio_names);
++
++		if (show_diffs) {
++			iomux_diff = iomux_reg ^ sb_gpio_group->iomux_defaults[i];
++			if (iomux_diff) {
++				if (!show_all)
++					print_iomux_reg(i, iomux_reg, sb_gpio_group->gpio_names);
++				print_iomux_diff(i, sb_gpio_group->iomux_defaults[i],
++						 iomux_diff, sb_gpio_group->gpio_names);
++				if (!show_all)
++					printf("\n");
++			}
++		}
++	}
++
++	for (i = 0; i < AMD_GPIO_BANK_SIZE * sb_gpio_group->gpio_bank_count; i++) {
++		if (use_smn)
++			gpio_reg = smn_read32((uint32_t)(uintptr_t)(gpio_base + i)) ;
++		else
++			gpio_reg = read32(gpio_base + i);
++
++		print_gpio_reg(i, gpio_reg, false);
++
++		if (show_diffs) {
++			gpio_diff = gpio_reg ^ sb_gpio_group->gpio_defaults[i];
++			if (gpio_diff)
++				print_gpio_diff(i, sb_gpio_group->gpio_defaults[i], gpio_diff);
++		}
++	}
++
++	if (show_all) {
++		printf("\n========== GPIO CONFIG ===========\n\n");
++
++		for (i = 0; i < AMD_GPIO_BANK_SIZE * sb_gpio_group->gpio_bank_count; i++) {
++			if (is_special_gpio_register(i * 4, sb_gpio_group))
++				continue;
++
++			if (use_smn)
++				gpio_reg = smn_read32((uint32_t)(uintptr_t)(gpio_base + i)) ;
++			else
++				gpio_reg = read32(gpio_base + i);
++
++			print_gpio_reg(i, gpio_reg, true);
++		}
++	}
++
++	return 0;
++}
+diff --git a/util/amdtool/irq.c b/util/amdtool/irq.c
+new file mode 100644
+index 000000000000..9f61ccc738a1
+--- /dev/null
++++ b/util/amdtool/irq.c
+@@ -0,0 +1,180 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include "amdtool.h"
++#include "smn.h"
++
++#define AMD_PCI_INTR_IDX	0xc00
++#define AMD_PCI_INTR_DATA	0xc01
++
++#define PCI_INTR_ROUTE_IOAPIC	0x80
++
++struct irq_routing_table {
++	const io_register_t irq_reg;
++	void (*print_irq_reg)(uint8_t val);
++};
++
++static void print_misc_irq(uint8_t val)
++{
++	static const char * const irq14_irq15_map[] = {
++		"legacy IDE",
++		"SATA_IDE",
++		"SATA2",
++		"SERIRQ/PCI",
++	};
++
++	printf("\tIRQ0 source: %s\n"
++	       "\tIRQ1 source: %s\n"
++	       "\tIRQ8 source: %s\n"
++	       "\tIRQ12 source: %s\n"
++	       "\tIRQ14 mapped to: %s\n"
++	       "\tIRQ15 mapped to: %s\n",
++	       val & 0x1 ? "SERIRQ/PCI" : "i8254",
++	       val & 0x2 ? "SERIRQ/PCI" : "IMC",
++	       val & 0x4 ? "SERIRQ/PCI" : "RTC",
++	       val & 0x8 ? "SERIRQ/PCI" : "IMC",
++	       irq14_irq15_map[(val >> 4) & 0x3],
++ 	       irq14_irq15_map[(val >> 6) & 0x3]);
++}
++
++static void print_misc0_irq(uint8_t val)
++{
++	printf("\t%s\n"
++	       "\tUSB IRQ1 source: %s\n"
++	       "\tUSB IRQ12 source: %s\n"
++	       "\tIRQ1/IRQ12 mask: %sabled\n"
++	       "\tIRQ input: %s\n"
++	       "\tIRQ1 filter: %sabled\n"
++	       "\tIRQ12 filter: %sabled\n"
++	       "\tINTR delay 600ns: %sabled\n",
++	       val & 0x1 ? "IOAPIC INT2 from PIC IRQ0, IOAPIC INT0 from PIC INTR"
++			 : "IOAPIC INT0 from PIC IRQ0, IOAPIC INT2 from PIC INTR",
++	       val & 0x2 ? "IMC IRQ1" : "serial IRQ1",
++	       val & 0x4 ? "IMC IRQ12" : "serial IRQ12",
++	       val & 0x8 ? "en" : "dis",
++	       val & 0x10 ? "enabled" : "masked off",
++	       val & 0x20 ? "en" : "dis",
++	       val & 0x40 ? "en" : "dis",
++	       val & 0x80 ? "en" : "dis");
++}
++
++static const struct irq_routing_table kunlun_irq_routing[] = {
++	{ { 0x00, 1, "INTA#" }, NULL },
++	{ { 0x01, 1, "INTB#" }, NULL },
++	{ { 0x02, 1, "INTC#" }, NULL },
++	{ { 0x03, 1, "INTD#" }, NULL },
++	{ { 0x04, 1, "INTE#" }, NULL },
++	{ { 0x05, 1, "INTF#/GENINT2" }, NULL },
++	{ { 0x06, 1, "INTG#" }, NULL },
++	{ { 0x07, 1, "INTH#" }, NULL },
++	{ { 0x08, 1, "Misc" }, print_misc_irq },
++	{ { 0x09, 1, "Misc0" }, print_misc0_irq },
++	{ { 0x0A, 1, "Misc1/HPET_L" }, NULL },
++	{ { 0x0B, 1, "Misc2/HPET_H" }, NULL },
++	{ { 0x0C, 1, "INTA from SERIRQ" }, NULL },
++	{ { 0x0D, 1, "INTB from SERIRQ" }, NULL },
++	{ { 0x0E, 1, "INTC from SERIRQ" }, NULL },
++	{ { 0x0F, 1, "INTD from SERIRQ" }, NULL },
++	{ { 0x10, 1, "SCI" }, NULL },
++	{ { 0x11, 1, "SMBUS0" }, NULL },
++	{ { 0x12, 1, "ASF" }, NULL },
++	{ { 0x13, 1, "HDA" }, NULL },
++	{ { 0x14, 1, "GBE0" }, NULL },
++	{ { 0x15, 1, "GBE1" }, NULL },
++	{ { 0x16, 1, "PerMon" }, NULL },
++	{ { 0x17, 1, "SD" }, NULL },
++	{ { 0x1A, 1, "SDIO" }, NULL },
++	{ { 0x20, 1, "CIR (no IRQ connected)" }, NULL },
++	{ { 0x21, 1, "GPIOa (from PAD_FANIN0)" }, NULL },
++	{ { 0x22, 1, "GPIOb (from PAD_FANOUT0)" }, NULL },
++	{ { 0x23, 1, "GPIOc (no IRQ connected)" }, NULL },
++	{ { 0x30, 1, "USB Emu" }, NULL },
++	{ { 0x31, 1, "USB Dual Role 1" }, NULL },
++	{ { 0x32, 1, "USB Dual Role 2" }, NULL },
++	{ { 0x34, 1, "XHCI0" }, NULL },
++	{ { 0x35, 1, "USB SSIC" }, NULL },
++	{ { 0x40, 1, "IDE" }, NULL },
++	{ { 0x41, 1, "SATA" }, NULL },
++	{ { 0x42, 1, "UFS" }, NULL },
++	{ { 0x43, 1, "EMMC" }, NULL },
++	{ { 0x50, 1, "GPPInt0" }, NULL },
++	{ { 0x51, 1, "GPPInt1" }, NULL },
++	{ { 0x52, 1, "GPPInt2" }, NULL },
++	{ { 0x53, 1, "GPPInt3" }, NULL },
++	{ { 0x60, 1, "SCI interrupt" }, NULL },
++	{ { 0x61, 1, "SMI interrupt" }, NULL },
++	{ { 0x62, 1, "GPIO controller interrupt" }, NULL },
++	{ { 0x70, 1, "I2C0/I3C0" }, NULL },
++	{ { 0x71, 1, "I2C1/I3C1" }, NULL },
++	{ { 0x72, 1, "I2C2/I3C2" }, NULL },
++	{ { 0x73, 1, "I2C3/I3C3" }, NULL },
++	{ { 0x74, 1, "UART0" }, NULL },
++	{ { 0x75, 1, "UART1" }, NULL },
++	{ { 0x76, 1, "I2C4" }, NULL },
++	{ { 0x77, 1, "I2C5" }, NULL },
++	{ { 0x78, 1, "UART2" }, NULL },
++	{ { 0x79, 1, "UART3" }, NULL },
++};
++
++static uint8_t read_irq_reg(uint8_t addr)
++{
++	outb(addr, AMD_PCI_INTR_IDX);
++	return inb(AMD_PCI_INTR_DATA);
++}
++
++int print_irq_routing(struct pci_dev *sb)
++{
++	int i, irq_table_size;
++	const struct irq_routing_table *irq_table = NULL;
++	int smbus_rev;
++	uint8_t reg;
++
++	printf("\n============= IRQ routing ==============\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			irq_table_size = ARRAY_SIZE(kunlun_irq_routing);
++			irq_table = kunlun_irq_routing;
++			break;
++		default:
++			printf("Error: Dumping IRQ routing on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping IRQ routing on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	printf("PIC routing:\n\n");
++	for (i = 0; i < irq_table_size; i++) {
++		reg = read_irq_reg(irq_table[i].irq_reg.addr);
++		printf("IRQ REG 0x%02x = 0x%02x (%s)\n", irq_table[i].irq_reg.addr,
++							 reg, irq_table[i].irq_reg.name);
++		if (irq_table[i].print_irq_reg)
++			irq_table[i].print_irq_reg(reg);
++	}
++
++	printf("\nIOAPIC routing:\n\n");
++	for (i = 0; i < irq_table_size; i++) {
++		reg = read_irq_reg(irq_table[i].irq_reg.addr | PCI_INTR_ROUTE_IOAPIC);
++		printf("IRQ REG 0x%02x = 0x%02x (%s)\n",
++		       irq_table[i].irq_reg.addr | PCI_INTR_ROUTE_IOAPIC,
++		       reg, irq_table[i].irq_reg.name);
++		if (irq_table[i].print_irq_reg)
++			irq_table[i].print_irq_reg(reg);
++	}
++
++	printf("========================================\n");
++
++	return 0;
++}
+diff --git a/util/amdtool/lpc.c b/util/amdtool/lpc.c
+new file mode 100644
+index 000000000000..d18b249a05ac
+--- /dev/null
++++ b/util/amdtool/lpc.c
+@@ -0,0 +1,122 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <inttypes.h>
++#include <commonlib/helpers.h>
++#include "amdtool.h"
++
++static const io_register_t kunlun_lpc_cfg_registers[] = {
++	{0x00, 4, "ID"},
++	{0x04, 2, "CMD"},
++	{0x06, 2, "STS"},
++	{0x08, 1, "RID"},
++	{0x09, 1, "CC[2]"},
++	{0x0A, 1, "CC[1]"},
++	{0x0B, 1, "CC[0]"},
++	{0x0C, 1, "CLSIZE"},
++	{0x0D, 1, "LATTMR"},
++	{0x0E, 1, "HTYPE"},
++	{0x2C, 4, "SS"},
++	{0x34, 1, "CAPP"},
++	{0x40, 1, "PCICTL"},
++	{0x44, 4, "IOPDE"},
++	{0x48, 4, "IOMPDE"},
++	{0x4C, 4, "MEMRNG"},
++	{0x50, 4, "ROMPROT[0]"},
++	{0x54, 4, "ROMPROT[1]"},
++	{0x58, 4, "ROMPROT[2]"},
++	{0x5C, 4, "ROMPROT[3]"},
++	{0x60, 4, "LPCMEMADDR"},
++	{0x64, 4, "PCIWIDEIO"},
++	{0x68, 4, "ROMADDR[0]"},
++	{0x6C, 4, "ROMADDR[1]"},
++	{0x70, 4, "FWHUBSEL"},
++	{0x74, 4, "ALTWIDEIO"},
++	{0x78, 4, "MISCCTL"},
++	{0x7C, 1, "TPM"},
++	{0x7D, 1, "LPCCLKCNTL"},
++	{0x84, 4, "TMKBCBASELO"},
++	{0x88, 4, "TMKBCBASEHI"},
++	{0x8C, 2, "TMKBCREMAP"},
++	{0x90, 2, "PCIWIDEIO2"},
++	{0x98, 4, "EC_LPC_CTL"},
++	{0x9C, 4, "GEC_SHDWROM_ADDR"},
++	{0xA0, 4, "SPIBASE"},
++	{0xA4, 2, "EC_PORT_ADDR"},
++	{0xA8, 4, "ROM3_LO"},
++	{0xAC, 4, "ROM3_HI"},
++	{0xB8, 4, "ROMDMACTL"},
++	{0xBA, 1, "EC_CTL"},
++	{0xBB, 1, "HOST_CTL"},
++	{0xC8, 4, "CLIENT_ROM_PROTECT"},
++	{0xCC, 4, "AUTO_ROM_CFG"},
++	{0xD0, 4, "CLKCTL"},
++	{0xD4, 4, "CLKRUNOPT"},
++	{0xDC, 4, "MISCCTL"},
++	{0xE0, 4, "ROMPROT[4]"},
++	{0xE4, 4, "ROMPROT[5]"},
++	{0xE8, 4, "ROMPRO6[7]"},
++	{0xEC, 4, "ROMPROT[7]"},
++};
++
++int print_lpc(struct pci_dev *sb)
++{
++	size_t i, cfg_registers_size = 0;
++	const io_register_t *cfg_registers;
++	int smbus_rev = 0;
++
++	printf("\n========== LPC =========\n\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			cfg_registers = kunlun_lpc_cfg_registers;
++			cfg_registers_size = ARRAY_SIZE(kunlun_lpc_cfg_registers);
++			break;
++		default:
++			printf("Error: Dumping LPC on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping LPC on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	for (i = 0; i < cfg_registers_size; i++) {
++		switch (cfg_registers[i].size) {
++		case 4:
++			printf("0x%04x: 0x%08x (%s)\n",
++				cfg_registers[i].addr,
++				pci_read_long(sb, cfg_registers[i].addr),
++				cfg_registers[i].name);
++			break;
++		case 2:
++			printf("0x%04x: 0x%04x     (%s)\n",
++				cfg_registers[i].addr,
++				pci_read_word(sb, cfg_registers[i].addr),
++				cfg_registers[i].name);
++			break;
++		case 1:
++			printf("0x%04x: 0x%02x       (%s)\n",
++				cfg_registers[i].addr,
++				pci_read_byte(sb, cfg_registers[i].addr),
++				cfg_registers[i].name);
++			break;
++		default:
++			printf("Error: register size %d not implemented.\n",
++				cfg_registers[i].size);
++			break;
++		}
++	}
++
++	return 0;
++}
+diff --git a/util/amdtool/psb.c b/util/amdtool/psb.c
+new file mode 100644
+index 000000000000..a6f86b0f6c0f
+--- /dev/null
++++ b/util/amdtool/psb.c
+@@ -0,0 +1,149 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include "amdtool.h"
++#include "smn.h"
++
++#define SMN_PSP_PUBLIC_BASE		0x3800000
++
++#define MP0_C2P_MSG_BASE		0x10500
++#define MPASP_C2P_MSG_BASE		0x10900
++
++#define CORE_2_PSP_MSG_37_OFFSET	(MPASP_C2P_MSG_BASE + (37 * 4))
++#define CORE_2_PSP_MSG_38_OFFSET	(MPASP_C2P_MSG_BASE + (38 * 4))
++
++static const io_register_t breithorn_c2p_msg_37_fields[] = {
++	{0x00, 8, "PLATFORM_VENDOR_ID"},
++	{0x08, 4, "PLATFORM_MODEL_ID"},
++	{0x0c, 4, "BIOS_KEY_REVISION_ID"},
++	{0x10, 4, "ROOT_KEY_SELECT"},
++	{0x18, 1, "PLATFORM_SECURE_BOOT_EN"},
++	{0x19, 1, "DISABLE_BIOS_KEY_ANTIROLLBACK"},
++	{0x1a, 1, "DISABLE_AMD_KEY_USAGE"},
++	{0x1b, 1, "DISABLE_SECURE_DEBUG_UNLOCK"},
++	{0x1c, 1, "CUSTOMER_KEY_LOCK"},
++};
++
++static const io_register_t breithorn_c2p_msg_38_fields[] = {
++	{0x00, 8, "PSB Status/Error"},
++	{0x08, 1, "PSB Fusing Readiness"},
++	{0x0c, 1, "SPL Fuse Update Required"},
++	{0x0d, 1, "SPL Fuse Error"},
++	{0x0e, 1, "SPL Entry Error"},
++	{0x0f, 1, "SPL Table Missing"},
++	{0x1c, 1, "HSTISTATE_PSP_SECURE_EN"},
++	{0x1d, 1, "HSTISTATE_PSP_PLATFORM_SECURE_EN"},
++	{0x1e, 1, "HSTISTATE_PSP_DEBUG_LOCK_ON"},
++	{0x1f, 1, "HSTISTATE_PSP_CUSTOMER_KEY_LOCK_ON"},
++};
++/* For better readiability and less SLOC, we override the initialized values.
++ * Hide the warnings, as they will overflow the screen and make it harder to
++ * focus on real compiler errors and warnings.
++ */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Woverride-init"
++
++const char *const c2p_msg_38_error_codes[] = {
++	[0 ... 0xff] = "Other",
++	[0x00] = "PSB passed/no error",
++	[0x22] = "BIOS signing key entry not found",
++	[0x3e] = "Error reading fuse info",
++	[0x64] = "Timeout error attempting to fuse",
++	[0x6c] = "Error in BIOS Directory Table - Reset image not found",
++	[0x6f] = "OEM BIOS signing key usage flag violation",
++	[0x78] = "BIOS RTM signature entry not found",
++	[0x79] = "BIOS copy to DRAM failed",
++	[0x7a] = "BIOS RTM signature verification failed",
++	[0x7b] = "OEM BIOS signing key failed signature verification",
++	[0x7c] = "Platform Vendor ID and/or Model ID binding violation",
++	[0x7d] = "BIOS Copy bit is unset for reset image",
++	[0x7e] = "Requested fuse is already blown",
++	[0x7f] = "Error with actual fusing operation",
++	[0x80] = "Processor1: Error reading fuse info",
++	[0x81] = "Processor1: Requested fuse is already blown",
++	[0x82] = "Processor1: Platform Vendor ID and/or Model ID binding violation",
++	[0x83] = "Processor1: Error with actual fusing operation",
++	[0x92] = "Error in BIOS Directory Table - Firmware type mismatch",
++};
++
++#pragma GCC diagnostic pop
++
++static void print_psb_status_v2(const char * const *psb_status_codes,
++				const io_register_t *status_fields, size_t status_size,
++				const io_register_t *hsti_fields, size_t hsti_size)
++{
++	uint32_t status, hsti;
++	uint8_t psb_state;
++	size_t i;
++
++	status = smn_read32(SMN_PSP_PUBLIC_BASE + CORE_2_PSP_MSG_37_OFFSET);
++	printf("PSB: STATUS = %08"PRIx32"\n", status);
++
++	if (status_fields) {
++		for (i = 0; i < status_size; i++) {
++			unsigned int val = status >> status_fields[i].addr;
++			val &= ((1 << status_fields[i].size) -1);
++			printf("0x%04x = %s\n", val, status_fields[i].name);
++		}
++	}
++
++	hsti = smn_read32(SMN_PSP_PUBLIC_BASE + CORE_2_PSP_MSG_38_OFFSET);
++	printf("PSB: HSTI = %08"PRIx32"\n", hsti);
++
++	if (hsti_fields) {
++		for (i = 0; i < hsti_size; i++) {
++			unsigned int val = hsti >> hsti_fields[i].addr;
++			val &= ((1 << hsti_fields[i].size) -1);
++			if (psb_status_codes && i == 0)
++				printf("0x%04x = %s (%s)\n", val, hsti_fields[i].name, psb_status_codes[val]);
++			else
++				printf("0x%04x = %s\n", val, hsti_fields[i].name);
++		}
++	}
++
++	printf("\n\n");
++
++	psb_state = ((status >> 23) & 2) | ((status >> 28) & 1);
++	switch (psb_state) {
++	case 0:
++		printf("PSB state: NOT ENABLED\n");
++		printf("You may flash other firmware!\n"
++		       "But the Platform Secure Boot state may still be changed to ENABLED or DISABLED!\n");
++		break;
++	case 1:
++		printf("PSB state: DISABLED\n");
++		printf("You may flash other firmware!\n"
++		       "Platform Secure Boot is permanently DISABLED!\n");
++		break;
++	case 2:
++		printf("PSB state: ENABLED\n");
++		printf("You may NOT flash other firmware!\n"
++		       "Platform Secure Boot is permanently ENABLED!\n");
++		break;
++	default:
++		printf("PSB state: UNKNOWN\n");
++		break;
++	}
++}
++
++void print_psb(struct pci_dev *nb)
++{
++	printf("============= Platform Secure Boot ==============\n\n");
++
++	switch (nb->device_id) {
++	case PCI_DEVICE_ID_AMD_BRH_ROOT_COMPLEX:
++		print_psb_status_v2(c2p_msg_38_error_codes,
++				    breithorn_c2p_msg_37_fields,
++				    ARRAY_SIZE(breithorn_c2p_msg_37_fields),
++				    breithorn_c2p_msg_38_fields,
++				    ARRAY_SIZE(breithorn_c2p_msg_38_fields));
++		break;
++	default:
++		printf("Error: Dumping PSB status on this northbridge is not (yet) supported.\n");
++		break;
++	}
++
++	printf("\n=================================================\n");
++}
+diff --git a/util/amdtool/smn.c b/util/amdtool/smn.c
+new file mode 100644
+index 000000000000..76afb7f2a4c2
+--- /dev/null
++++ b/util/amdtool/smn.c
+@@ -0,0 +1,42 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include "smn.h"
++#include "amdtool.h"
++
++#define SMN_INDIRECT_INDEX		0xB8
++#define SMN_INDIRECT_DATA		0xBC
++
++static struct pci_dev *nb_dev = NULL;
++
++uint32_t smn_read32(uint32_t addr)
++{
++	if (!nb_dev)
++		return UINT32_MAX;
++
++	pci_write_long(nb_dev, SMN_INDIRECT_INDEX, addr & 0xfffffffc);
++	return pci_read_long(nb_dev, SMN_INDIRECT_DATA);
++}
++
++uint16_t smn_read16(uint32_t addr)
++{
++	if (!nb_dev)
++		return UINT8_MAX;
++
++	pci_write_long(nb_dev, SMN_INDIRECT_INDEX, addr & 0xfffffffc);
++	return pci_read_word(nb_dev, SMN_INDIRECT_DATA + (addr & 2));
++}
++
++uint8_t smn_read8(uint32_t addr)
++{
++	if (!nb_dev)
++		return UINT8_MAX;
++
++	pci_write_long(nb_dev, SMN_INDIRECT_INDEX, addr & 0xfffffffc);
++	return pci_read_byte(nb_dev, SMN_INDIRECT_DATA + (addr & 3));
++}
++
++void init_smn(struct pci_dev *nb)
++{
++	nb_dev = nb;
++}
+diff --git a/util/amdtool/smn.h b/util/amdtool/smn.h
+new file mode 100644
+index 000000000000..ae23875f11f8
+--- /dev/null
++++ b/util/amdtool/smn.h
+@@ -0,0 +1,15 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef AMDTOOL_SMN_H
++#define AMDTOOL_SMN_H 1
++
++#include <stdint.h>
++#include "amdtool.h"
++
++uint32_t smn_read32(uint32_t addr);
++uint16_t smn_read16(uint32_t addr);
++uint8_t smn_read8(uint32_t addr);
++void init_smn(struct pci_dev *nb);
++
++#endif
+diff --git a/util/amdtool/spi.c b/util/amdtool/spi.c
+new file mode 100644
+index 000000000000..b15ebd029857
+--- /dev/null
++++ b/util/amdtool/spi.c
+@@ -0,0 +1,405 @@
++/* amdtool - dump all registers on an AMD CPU + chipset based system */
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include "amdtool.h"
++#include "smn.h"
++
++#define AMD_FCH_SPIBAR_OFFSET	0xa0
++
++#define BRH_SPI_SMN_BASE	0x2DC4000
++
++static const io_register_t spi100_speed_cfg_fields[] = {
++	{ 0x0, 4, "TPM Speed" },
++	{ 0x4, 4, "Alt Speed" },
++	{ 0x8, 4, "Fast Read Speed" },
++	{ 0xc, 4, "Normal Speed" },
++};
++
++static const io_register_t spi100_host_prefetch_cfg_fields[] = {
++	{ 0x0, 7, "Host Prefetch Size" },
++	{ 0x7, 1, "Host Prefetch on 64B Boudnary" },
++	{ 0x8, 4, "Host Hit Range" },
++	{ 0xc, 1, "Host Will Hit Enable" },
++	{ 0xd, 1, "Host Hit Soon Enable" },
++	{ 0xe, 1, "Host Burst Enable" },
++	{ 0xf, 1, "Host Burst to 4DW Enable" },
++};
++
++static const io_register_t kunlun_spi_cntl0_fields[] = {
++	{ 0x0, 8, "Spi OpCode (Reserved)" },
++	{ 0x8, 1, "Disable Index Retry" },
++	{ 0x9, 1, "Index Cacheline Stop" },
++	{ 0xA, 2, "ROM Protection Compare Range" },
++	{ 0x12, 1, "SPI Read Mode [0]" },
++	{ 0x15, 1, "Illegal Access" },
++	{ 0x16, 1, "SPI MAC Access ROM Enable" },
++	{ 0x17, 1, "SPI Host Access ROM Enable" },
++	{ 0x1c, 1, "SPI Clock Gate" },
++	{ 0x1d, 1, "SPI Read Mode [1]" },
++	{ 0x1e, 1, "SPI Read Mode [2]" },
++	{ 0x1f, 1, "SPI Busy" },
++};
++
++static const io_register_t kunlun_alt_spi_cs_fields[] = {
++	{ 0x0, 2, "Alt SPI CS Enable" },
++	{ 0x3, 1, "SPI Protect Enable 0" },
++	{ 0x5, 1, "SPI Protect Lock" },
++	{ 0x6, 1, "Lock SPI CS" },
++};
++
++static const char * const kunlun_spi100_speed_values[] = {
++	"66.66 MHz",
++	"33.33 MHz",
++	"22.22 MHz",
++	"16.66 Mhz",
++	"100 MHz",
++	"800 KHz",
++	"Defined in SPIx6C[5:0]",
++	"Defined in SPIx6C[13:8]"
++};
++
++static const io_register_t kunlun_spi_bar_registers[] = {
++	{ 0x00, 4, "SPI Control 0" },
++	{ 0x04, 4, "SPI Restricted Command" },
++	{ 0x08, 4, "SPI Restricted Command 2" },
++	{ 0x0C, 4, "SPI Control 1" },
++	{ 0x10, 4, "ESPI Control" },
++	{ 0x14, 4, "SPI Command Value 1" },
++	{ 0x18, 4, "SPI Command Value 2" },
++	{ 0x1C, 1, "ROMCP CS" },
++	{ 0x1D, 1, "SPI ALT CS" },
++	{ 0x20, 4, "SPI100 Enable" },
++	{ 0x24, 4, "SPI100 Precyc0" },
++	{ 0x28, 4, "SPI100 Precyc1" },
++	{ 0x2C, 2, "SPI100 Host Prefetch Config" },
++	{ 0x2E, 2, "TPM SPI DI Timeout" },
++	{ 0x30, 2, "ROM2 Address Override" },
++	{ 0x32, 2, "SPI100 Dummy Cycle Config" },
++	{ 0x32, 2, "SPI100 Rx Timing Config" },
++	{ 0x40, 1, "DDR Command Code" },
++	{ 0x41, 1, "QDR Command Code" },
++	{ 0x42, 1, "DPR Command Code" },
++	{ 0x43, 1, "QPR Command Code" },
++	{ 0x44, 1, "Mode Byte" },
++	{ 0x50, 4, "Addr32 Control 0" },
++	{ 0x54, 4, "Addr32 Control 1" },
++	{ 0x58, 4, "Addr32 Control 2" },
++	{ 0x5C, 4, "Addr32 Control 3" },
++	{ 0x60, 4, "BAR 64MB ROM3 Low" },
++	{ 0x64, 4, "BAR 64MB ROM3 High" },
++	{ 0x68, 4, "SPI Restricted Command 3" },
++	{ 0x6C, 4, "SPI Speed" },
++	{ 0x70, 4, "Host Interrupt" },
++	{ 0x74, 4, "LPC SPI Interrupt" },
++	{ 0x78, 4, "Flash Idle COunt" },
++	{ 0xFC, 2, "SPI Misc Control" },
++};
++
++
++int use_smn_access = 0;
++volatile uint8_t *spibar = NULL;
++uint32_t spi_smn_base = 0;
++
++static uint8_t spi_read8(uint32_t offset)
++{
++	if (use_smn_access)
++		return smn_read8(spi_smn_base + offset);
++	else
++		return read8(spibar + offset);
++}
++
++static uint16_t spi_read16(uint32_t offset)
++{
++	if (use_smn_access)
++		return smn_read16(spi_smn_base + offset);
++	else
++		return read16(spibar + offset);
++}
++
++static uint32_t spi_read32(uint32_t offset)
++{
++	if (use_smn_access)
++		return smn_read32(spi_smn_base + offset);
++	else
++		return read32(spibar + offset);
++}
++
++static int print_spi_cntrl0(struct pci_dev *sb)
++{
++	int i, size = 0;
++	int smbus_rev = 0;
++	uint32_t spi_cntrl0 = UINT32_MAX;
++	const io_register_t *spi_cntrl_register = NULL;
++
++	printf("\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			spi_cntrl0 = spi_read32(0);
++			spi_cntrl_register = kunlun_spi_cntl0_fields;
++			size = ARRAY_SIZE(kunlun_spi_cntl0_fields);
++			break;
++		default:
++			printf("Error: Dumping SPI CNTRL on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping SPI CNTRL on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	printf("SPI_CNTRL0 = 0x%08x\n\n", spi_cntrl0);
++
++	if (spi_cntrl_register) {
++		for (i = 0; i < size; i++) {
++			unsigned int val = spi_cntrl0 >> spi_cntrl_register[i].addr;
++			val &= ((1 << spi_cntrl_register[i].size) -1);
++			printf("0x%04x = %s\n", val, spi_cntrl_register[i].name);
++		}
++	}
++
++	return 0;
++}
++
++static int print_spi_alt_cs(struct pci_dev *sb)
++{
++	int i, size = 0;
++	int smbus_rev = 0;
++	uint8_t spi_alt_cs = 0xff;
++	const io_register_t *spi_alt_cs_register = NULL;
++
++	printf("\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			spi_alt_cs = spi_read8(0x1d);
++			spi_alt_cs_register = kunlun_alt_spi_cs_fields;
++			size = ARRAY_SIZE(kunlun_alt_spi_cs_fields);
++			break;
++		default:
++			printf("Error: Dumping SPI_ATL_CS on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping SPI_ATL_CS on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	printf("SPI_ALT_CS = 0x%02x\n\n", spi_alt_cs);
++
++	if (spi_alt_cs_register) {
++		for (i = 0; i < size; i++) {
++			unsigned int val = spi_alt_cs >> spi_alt_cs_register[i].addr;
++			val &= ((1 << spi_alt_cs_register[i].size) -1);
++			printf("0x%04x = %s\n", val, spi_alt_cs_register[i].name);
++		}
++	}
++
++	return 0;
++}
++
++static int print_spi_speed_config(struct pci_dev *sb)
++{
++	size_t i, size = 0, values_size = 0;
++	uint16_t spi_speed_cfg = UINT16_MAX;
++	const io_register_t *spi_speed_cfg_register = NULL;
++	const char * const *speed_values = NULL;
++	int smbus_rev = 0;
++
++	printf("\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			spi_speed_cfg = spi_read16(0x22);
++			spi_speed_cfg_register = spi100_speed_cfg_fields;
++			size = ARRAY_SIZE(spi100_speed_cfg_fields);
++			speed_values = kunlun_spi100_speed_values;
++			values_size = ARRAY_SIZE(kunlun_spi100_speed_values);
++			break;
++		default:
++			printf("Error: Dumping SPI100_SPEED_CFG on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping SPI100_SPEED_CFG on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	printf("SPI100_SPEED_CFG = 0x%04x\n\n", spi_speed_cfg);
++
++	if (spi_speed_cfg_register && speed_values) {
++		for (i = 0; i < size; i++) {
++			unsigned int val = spi_speed_cfg >> spi_speed_cfg_register[i].addr;
++			val &= ((1 << spi_speed_cfg_register[i].size) -1);
++			if (val < values_size)
++				printf("0x%04x = %s (%s)\n", val, spi_speed_cfg_register[i].name,
++							     speed_values[val]);
++			else
++				printf("0x%04x = %s (Reserved)\n", val, spi_speed_cfg_register[i].name);
++		}
++	}
++
++	return 0;
++}
++
++static int print_spi_host_prefetch(struct pci_dev *sb)
++{
++	int i, size = 0;
++	uint16_t spi_host_prefetch = UINT16_MAX;
++	const io_register_t *spi_host_prefetch_register = NULL;
++	int smbus_rev = 0;
++
++	printf("\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			spi_host_prefetch = spi_read16(0x2c);
++			spi_host_prefetch_register = spi100_host_prefetch_cfg_fields;
++			size = ARRAY_SIZE(spi100_host_prefetch_cfg_fields);
++			break;
++		default:
++			printf("Error: Dumping SPI100_HOST_PREFETCH_CFG on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping SPI100_HOST_PREFETCH_CFG on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	printf("SPI100_HOST_PREFETCH_CFG = 0x%04x\n\n", spi_host_prefetch);
++
++	if (spi_host_prefetch_register) {
++		for (i = 0; i < size; i++) {
++			unsigned int val = spi_host_prefetch >> spi_host_prefetch_register[i].addr;
++			val &= ((1 << spi_host_prefetch_register[i].size) - 1);
++			printf("0x%04x = %s\n", val, spi_host_prefetch_register[i].name);
++		}
++	}
++
++	return 0;
++}
++
++static int print_spibar(struct pci_dev *sb)
++{
++	int i, size = 0, spi_size = 0x1000;
++	uint32_t spibar_phys, spibar_mask;
++	const io_register_t *spi_register = NULL;
++	int smbus_rev;
++
++	printf("\n============= SPI Bar ==============\n\n");
++
++	switch (sb->device_id) {
++	case PCI_DEVICE_ID_AMD_FCH_LPC_2:
++		smbus_rev = find_smbus_dev_rev(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FCH_SMB_2);
++		if (smbus_rev == -1)
++			return 1;
++
++		switch (smbus_rev) {
++		case 0x71:
++			size = ARRAY_SIZE(kunlun_spi_bar_registers);
++			spi_register = kunlun_spi_bar_registers;
++			spibar_mask = 0xffffff00;
++			spi_smn_base = BRH_SPI_SMN_BASE;
++			break;
++		default:
++			printf("Error: Dumping SPI on this southbridge is not (yet) supported.\n");
++			return 1;
++		}
++
++		break;
++	default:
++		printf("Error: Dumping SPI on this southbridge is not (yet) supported.\n");
++		return 1;
++	}
++
++	spibar_phys = pci_read_long(sb, AMD_FCH_SPIBAR_OFFSET);
++	if ((spibar_phys & spibar_mask) == 0 || (spibar_phys == 0xffffffff)) {
++		if (spi_smn_base != 0) {
++			use_smn_access = 1;
++		} else {
++			perror("Error SPIBAR not programmed");
++			return 1;
++		}
++	} else {
++		if (spibar_phys == UINT32_MAX) {
++			perror("Error SPIBAR invalid");
++			return 1;
++		}
++
++		spibar = map_physical(spibar_phys & spibar_mask, spi_size);
++		if (spibar == NULL) {
++			perror("Error mapping SPIBAR");
++			return 1;
++		}
++
++	}
++
++	for (i = 0; i < size; i++) {
++		switch(spi_register[i].size) {
++			case 1:
++				printf("0x%08x = %s\n", spi_read8(spi_register[i].addr), spi_register[i].name);
++				break;
++			case 2:
++				printf("0x%08x = %s\n", spi_read16(spi_register[i].addr), spi_register[i].name);
++				break;
++			case 4:
++				printf("0x%08x = %s\n", spi_read32(spi_register[i].addr), spi_register[i].name);
++				break;
++			case 8:
++				printf("0x%08x%08x = %s\n", spi_read32(spi_register[i].addr + 4),
++					spi_read32(spi_register[i].addr), spi_register[i].name);
++				break;
++		}
++	}
++
++	print_spi_cntrl0(sb);
++	print_spi_alt_cs(sb);
++	print_spi_speed_config(sb);
++	print_spi_host_prefetch(sb);
++
++	if (spibar)
++		unmap_physical((void *)spibar, spi_size);
++
++	printf("\n====================================\n");
++
++	return 0;
++}
++
++int print_spi(struct pci_dev *sb)
++{
++	return print_spibar(sb);
++}
+-- 
+2.51.0

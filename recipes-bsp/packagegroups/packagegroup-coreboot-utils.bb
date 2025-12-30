@@ -10,6 +10,7 @@ PACKAGES = " \
 "
 
 RDEPENDS:${PN} = " \
+    amdtool \
     cbfstool \
     cbmem \
     ectool \
