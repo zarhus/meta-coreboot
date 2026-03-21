@@ -3,7 +3,7 @@ HOMEPAGE = "https://github.com/Dasharo/coreboot"
 
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "\
-    file://${WORKDIR}/git/LICENSES/GPL-2.0-only.txt;md5=5430828348d2cf7d4b5e8395f774a68e\
+    file://${UNPACKDIR}/${BP}/LICENSES/GPL-2.0-only.txt;md5=5430828348d2cf7d4b5e8395f774a68e\
 "
 
 DEPENDS += "wolfssl"
@@ -11,12 +11,12 @@ DEPENDS += "wolfssl"
 PV = "1.0+git${SRCPV}"
 
 SRC_URI = "\
-    git://github.com/Dasharo/coreboot.git;branch=dasharo;protocol=https\
+    git://github.com/Dasharo/coreboot.git;branch=dasharo;protocol=https \
 "
 
 SRCREV = "0c63e7441c20e8a96ca110f53a08db3ac7e5e7fd"
 
-S = "${WORKDIR}/git/util/txesbmantool"
+S = "${UNPACKDIR}/${BP}/util/txesbmantool"
 
 inherit pkgconfig
 

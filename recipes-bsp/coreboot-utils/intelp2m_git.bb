@@ -13,9 +13,10 @@ GO_IMPORT = "github.com/dasharo/coreboot/"
 # directory as expected by the go bbclass
 SRC_URI = " \
     git://github.com/dasharo/coreboot.git;protocol=https;branch=dasharo-4.21;destsuffix=${GO_IMPORT} \
-    "
+"
 
-S = "${WORKDIR}/${GO_IMPORT}/util/intelp2m"
+S = "${UNPACKDIR}/${GO_IMPORT}/util/intelp2m"
+PATCHDIR = "${UNPACKDIR}/${GO_IMPORT}"
 
 inherit goarch
 inherit go
