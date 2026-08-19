@@ -1,0 +1,43 @@
+From 8bc38947122a34d5515db696994962fda1985e69 Mon Sep 17 00:00:00 2001
+From: Kas User <kas@example.com>
+Date: Wed, 19 Aug 2026 20:11:25 +0000
+Subject: [PATCH] cbfstool: fix const-discarding warning in
+ extract_config_value
+
+In extract_config_value(), strchr() is called on a const char* pointer,
+returning a char* that discards the const qualifier. Storing this result
+in a char* variable triggers a compiler warning (or an error with
+-Werror=discarded-qualifiers). Change the variable to const char*
+to match the const semantics of the data - it is used only for pointer
+subtraction and as an endpoint for strndup(), both of which accept const
+char* without issue. This change fixes the warning with no downsides.
+
+Change-Id: Id5d72005232eed9a9aa15845df419d4878793130
+Signed-off-by: Mike Banon <mikebdp2@gmail.com>
+Reviewed-on: https://chromium-review.googlesource.com/c/chromiumos/platform/vboot_reference/+/7649170
+Reviewed-by: Yu-Ping Wu <yupingso@chromium.org>
+Tested-by: Jakub "Kuba" Czapiga <czapiga@google.com>
+Reviewed-by: Jakub "Kuba" Czapiga <czapiga@google.com>
+Commit-Queue: Yu-Ping Wu <yupingso@chromium.org>
+
+Upstream-Status: Backport [24655cd]
+Signed-off-by: Kas User <kas@example.com>
+---
+ host/lib/cbfstool.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/host/lib/cbfstool.c b/host/lib/cbfstool.c
+index 8e5414d53..0a971c723 100644
+--- a/host/lib/cbfstool.c
++++ b/host/lib/cbfstool.c
+@@ -181,7 +181,7 @@ static char *extract_config_value(const char *buf, const char *config_field)
+ 	free(to_find);
+ 
+ 	if (start) {
+-		char *end = strchr(start, '\n');
++		const char *end = strchr(start, '\n');
+ 		if (end)
+ 			return strndup(start, end - start);
+ 	}
+-- 
+2.39.2
