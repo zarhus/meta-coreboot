@@ -3,7 +3,7 @@ require coreboot-utils.inc
 SUMMARY = "Tool for manipulating CBFS file"
 
 SRC_URI += " \
-    git://review.coreboot.org/vboot.git;destsuffix=git/3rdparty/vboot;name=vboot;protocol=https;branch=main \
+    git://review.coreboot.org/vboot.git;destsuffix=${BB_GIT_DEFAULT_DESTSUFFIX}/3rdparty/vboot;name=vboot;protocol=https;branch=main \
     "
 
 SRCREV_vboot = "0c11187c755394683d1b75bdb103cb1959fa6d40"

@@ -9,8 +9,11 @@ PV = "4.21+git${SRCPV}"
 
 SRC_URI = " \
     git://github.com/Dasharo/coreboot.git;protocol=https;branch=dasharo-4.21\
-    "
+"
+SRC_URI:append = " \
+    file://0002-treewide-Work-around-GCC-15-Werror-unterminated-stri.patch;patchdir=${PATCHDIR} \
+"
 
 SRCREV = "d08d5eaa98b1204b5e665d3ae4f63fb6f84a0d77"
 
-S = "${WORKDIR}/git"
+PATCHDIR = "${UNPACKDIR}/${BB_GIT_DEFAULT_DESTSUFFIX}"

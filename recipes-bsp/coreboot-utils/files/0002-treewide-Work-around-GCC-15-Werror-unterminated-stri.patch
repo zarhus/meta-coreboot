@@ -1,0 +1,93 @@
+From 0c60beac7c621abe22c96b06f42e55b26c83d686 Mon Sep 17 00:00:00 2001
+From: Kas User <kas@example.com>
+Date: Sat, 21 Mar 2026 14:42:56 +0000
+Subject: [PATCH] treewide: Work around GCC 15
+ Werror=unterminated-string-initialization
+
+GCC 15 added a new `unterminated-string-initialization` warning. Even
+though crossgcc is still using GCC 14, some Linux distributions (e.g.
+Arch Linux) already started shipping GCC 15. Given that coreboot uses
+`-Werror` (warnings are errors), this new warning causes build errors
+for things built using the host toolchain, such as utilities. In this
+case, cbfstool is affected, which prevents building coreboot images.
+
+The nonstring attribute is used to tell the compiler whether or not a
+string is intentionally not null terminated. Since the attribute is
+only included in GCC 15 for multidimensional character arrays (and even
+later for clang) we need to check the GCC version before using the
+attribute.
+
+On GCC version prior to GCC 15 the nonstring attribute will not be used,
+but that is not a problem since the unterminated-string-initialization
+warning only exists since GCC 15. So you can still build on all GCC
+versions as before. This way it also works if your host toolchain is GCC
+15 (which builds commonlib code for cbfstool) and your coreboot cross
+toolchain is GCC 14 (which builds commonlib code for coreboot).
+Clang is a different matter. According to the documentation, the nonstring
+attribute only exists in version 21 which is not yet released by LLVM.
+
+TEST=Build qemu/Q35 successfully
+
+Change-Id: I919d71cb2811e91869ba1ff493a0719ddcc86c36
+
+Signed-off-by: Angel Pons <th3fanbus@gmail.com>
+Reviewed-on: https://review.coreboot.org/c/coreboot/+/87825
+Reviewed-by: Benjamin Doron <benjamin.doron00@gmail.com>
+Reviewed-by: Nicholas Chin <nic.c3.14@gmail.com>
+Reviewed-by: Matt DeVillier <matt.devillier@gmail.com>
+Tested-by: build bot (Jenkins) <no-reply@coreboot.org>
+
+Upstream-Status: Backport [25.06]
+Signed-off-by: Kas User <kas@example.com>
+---
+ src/commonlib/bsd/include/commonlib/bsd/compiler.h | 7 +++++++
+ src/commonlib/include/commonlib/loglevel.h         | 2 +-
+ util/cbfstool/common.c                             | 2 +-
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/commonlib/bsd/include/commonlib/bsd/compiler.h b/src/commonlib/bsd/include/commonlib/bsd/compiler.h
+index 6bde28db0e..a06ffc22de 100644
+--- a/src/commonlib/bsd/include/commonlib/bsd/compiler.h
++++ b/src/commonlib/bsd/include/commonlib/bsd/compiler.h
+@@ -62,6 +62,13 @@
+ #define __printf(a, b) __attribute__((format(printf, a, b)))
+ #endif
+
++/* This checks the support for the nonstring attribute on multidimensional character arrays. */
++#if (defined(__GNUC__) && __GNUC__ >= 15) || (defined(__clang__) && __clang_major__ >= 21)
++#define __nonstring __attribute__((__nonstring__))
++#else
++#define __nonstring
++#endif
++
+ /*
+  * This evaluates to the type of the first expression, unless that is constant
+  * in which case it evaluates to the type of the second. This is useful when
+diff --git a/src/commonlib/include/commonlib/loglevel.h b/src/commonlib/include/commonlib/loglevel.h
+index 34d9824179..5975ebb037 100644
+--- a/src/commonlib/include/commonlib/loglevel.h
++++ b/src/commonlib/include/commonlib/loglevel.h
+@@ -165,7 +165,7 @@
+  */
+ #define BIOS_LOG_PREFIX_PATTERN "[%.5s]  "
+ #define BIOS_LOG_PREFIX_MAX_LEVEL BIOS_SPEW
+-static const char bios_log_prefix[BIOS_LOG_PREFIX_MAX_LEVEL + 1][5] = {
++static const char __nonstring bios_log_prefix[BIOS_LOG_PREFIX_MAX_LEVEL + 1][5] = {
+ 	/* Note: These strings are *not* null-terminated to save space. */
+ 	[BIOS_EMERG]   = "EMERG",
+ 	[BIOS_ALERT]   = "ALERT",
+diff --git a/util/cbfstool/common.c b/util/cbfstool/common.c
+index 7154bc9d54..d5eb87ca25 100644
+--- a/util/cbfstool/common.c
++++ b/util/cbfstool/common.c
+@@ -192,7 +192,7 @@ uint64_t intfiletype(const char *name)
+
+ char *bintohex(uint8_t *data, size_t len)
+ {
+-	static const char translate[16] = "0123456789abcdef";
++	static const char __nonstring translate[16] = "0123456789abcdef";
+
+ 	char *result = malloc(len * 2 + 1);
+ 	if (result == NULL)
+--
+2.39.2

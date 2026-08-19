@@ -20,8 +20,6 @@ SRC_URI = " \
 "
 SRCREV = "dc68f9f1b56d92f76026dca490e79493599ff4cf"
 
-S = "${WORKDIR}/git"
-
 inherit pkgconfig
 
 TARGET_CC_ARCH += "${LDFLAGS}"

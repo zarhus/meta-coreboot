@@ -19,6 +19,7 @@ SRC_URI = " \
     git://github.com/coreboot/coreboot.git;branch=main;protocol=https \
     file://coreboot-amdtool.patch \
 "
+SRC_URI:remove = "file://0002-treewide-Work-around-GCC-15-Werror-unterminated-stri.patch;patchdir=${PATCHDIR}"
 
 SRCREV = "e59c5abd13e6be052281a77c076037bc85de7084"
 
