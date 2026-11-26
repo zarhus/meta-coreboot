@@ -10,11 +10,14 @@ DEPENDS += "wolfssl"
 
 PV = "1.0+git${SRCPV}"
 
+# Dasharo rebases its default coreboot branch. dasharo-24.12 is a release
+# branch that contains SRCREV. Checking a tag= against SRCREV needs bitbake
+# 2.12 (walnascar) or newer, so the recipe pins a release branch.
 SRC_URI = "\
-    git://github.com/Dasharo/coreboot.git;branch=dasharo;protocol=https\
+    git://github.com/Dasharo/coreboot.git;branch=dasharo-24.12;protocol=https\
 "
 
-SRCREV = "4706227e009b758a1bebace99f5bfba431874d7a"
+SRCREV = "0c63e7441c20e8a96ca110f53a08db3ac7e5e7fd"
 
 S = "${WORKDIR}/git/util/txesbmantool"
 
