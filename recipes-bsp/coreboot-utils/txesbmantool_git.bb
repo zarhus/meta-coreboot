@@ -10,11 +10,14 @@ DEPENDS += "wolfssl"
 
 PV = "1.0+git${SRCPV}"
 
+# hardkernel_odroid_h4_v0.9.1 is a Dasharo release tag. bitbake checks at
+# unpack time that it resolves to SRCREV. Dasharo branches can be rebased or
+# deleted, so nobranch=1 makes the fetch depend on the tag alone.
 SRC_URI = "\
-    git://github.com/Dasharo/coreboot.git;branch=dasharo;protocol=https \
+    git://github.com/Dasharo/coreboot.git;tag=hardkernel_odroid_h4_v0.9.1;nobranch=1;protocol=https \
 "
 
-SRCREV = "0c63e7441c20e8a96ca110f53a08db3ac7e5e7fd"
+SRCREV = "7d10ea629b5783add25bdcd201dc898e6bd2b2c1"
 
 S = "${UNPACKDIR}/${BP}/util/txesbmantool"
 
